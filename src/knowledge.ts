@@ -5,7 +5,7 @@ export type KnowledgeJob = { messageId: string };
 type Job = {
   message_id: string; status: string; extracted_text: string | null; cache_key: string | null;
   extraction_attempts: number; indexing_attempts: number; next_attempt_at: number;
-  text: string | null; message_type: string; conversation_id: string; source_type: string; sent_at: number; unsent_at: number | null;
+  sender_name: string | null; text: string | null; message_type: string; conversation_id: string; source_type: string; sent_at: number; unsent_at: number | null;
 };
 
 export async function enqueueKnowledge(messageId: string, env: Env): Promise<void> {
@@ -41,7 +41,7 @@ export function cancellationStatements(messageId: string, env: Env): D1PreparedS
 }
 
 async function load(messageId: string, env: Env): Promise<Job | null> {
-  return env.DB.prepare(`SELECT j.*, m.text, m.message_type, m.conversation_id, m.source_type, m.sent_at, m.unsent_at
+  return env.DB.prepare(`SELECT j.*, m.text, m.sender_name, m.message_type, m.conversation_id, m.source_type, m.sent_at, m.unsent_at
     FROM knowledge_jobs j JOIN messages m USING(message_id) WHERE message_id = ?`).bind(messageId).first<Job>();
 }
 
@@ -71,7 +71,7 @@ async function processKnowledge(messageId: string, env: Env): Promise<void> {
   if (["ready", "failed", "skipped"].includes(job.status) || job.next_attempt_at > Date.now()) return;
   let text = job.extracted_text;
   if (text === null) {
-    if (job.message_type === "text") text = job.text ?? "";
+    if (job.message_type === "text") text = job.sender_name ? `書き出し履歴・表示名: ${job.sender_name}\n${job.text ?? ""}` : job.text ?? "";
     else {
       const attachment = await env.DB.prepare(`SELECT a.*, m.message_type, m.conversation_id FROM attachments a JOIN messages m USING(message_id)
         WHERE a.message_id = ?`).bind(messageId).first<AttachmentContent & { status: string }>();

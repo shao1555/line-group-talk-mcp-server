@@ -1,3 +1,4 @@
+import { handleHistoryImport } from "./history-import";
 import { sha256 } from "./ai";
 import { readLimitedBody } from "./http";
 import { accessibleConversations, verifyConversationAccess } from "./conversations";
@@ -42,6 +43,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       ...accessible, connections: connections.results, mcpEndpoint: `${portalOrigin(env)}/mcp` });
   }
   if (!await validPortalMutation(request, session, env)) return Response.json({ error: "ページを再読み込みして試してください。" }, { status: 403 });
+  if (request.method === "POST" && (path === "/api/imports" || /^\/api\/imports\/[a-f0-9]{64}\/continue$/.test(path))) return handleHistoryImport(request, env, session.userId);
   const connection = path.match(/^\/api\/connections\/([a-f0-9-]{36})$/);
   if (connection && request.method === "DELETE") {
     const changed = await env.DB.prepare("UPDATE oauth_connections SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL")

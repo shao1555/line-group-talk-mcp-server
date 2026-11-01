@@ -52,6 +52,14 @@ describe("knowledge extraction and indexing", () => {
     expect(bindings.AI.run).toHaveBeenCalledTimes(1);
   });
 
+  it("indexes imported sender names without inventing LINE user IDs", async () => {
+    await post([message("去年は京都に行きました")]);
+    await env.DB.prepare("UPDATE messages SET sender_name = '書き出しの名前', user_id = NULL WHERE message_id = 'message-1'").run();
+    await consume();
+    expect(await job()).toMatchObject({ status: "ready", extracted_text: "書き出し履歴・表示名: 書き出しの名前\n去年は京都に行きました" });
+    expect(bindings.KNOWLEDGE.upsert).toHaveBeenCalledWith([expect.objectContaining({ namespace: "group-1" })]);
+  });
+
   it("extracts OCR and description, then indexes, without summarizing the conversation", async () => {
     await attachment();
     await consume();

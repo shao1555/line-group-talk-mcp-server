@@ -16,7 +16,7 @@ let lineFetch: MockInstance<typeof fetch>;
 
 beforeAll(async () => { await applyD1Migrations(env.DB, env.TEST_MIGRATIONS); });
 beforeEach(async () => {
-  await env.DB.batch(["attachments", "messages", "unsent_messages"].map((table) => env.DB.prepare(`DELETE FROM ${table}`)));
+  await env.DB.batch(["attachments", "messages", "unsent_messages", "history_imports"].map((table) => env.DB.prepare(`DELETE FROM ${table}`)));
   loginUser = user;
   membership = new Set();
   lineFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -200,5 +200,62 @@ describe("conversation visibility and MCP scopes", () => {
     const data = await (await call("/api/portal", { headers: { Cookie: session.cookie } })).json() as { conversations: unknown[]; incomplete: boolean };
     expect(data).toMatchObject({ conversations: [], incomplete: true });
     expect((await call("/api/tokens", mutation(session, { label: "Codex", conversationIds: [group] }))).status).toBe(503);
+  });
+});
+
+
+describe("history uploads", () => {
+  const exportText = '[LINE] いつものグループのトーク履歴\n保存日時：2026/11/01 13:15\n\n2019/08/05(月)\n12:15\t山田\tこんにちは\n12:16\t佐藤\t"複数行の発言\n続きです"\n12:17\t山田\t[写真]\n';
+  function upload(session: { cookie: string; csrf: string }, text = exportText, id = group) {
+    return call('/api/imports?' + new URLSearchParams({ conversationId: id, fileName: 'LINE.txt' }), { ...mutation(session), body: text });
+  }
+  it("previews, imports into one authorized talk, preserves provenance and deduplicates", async () => {
+    await seen(group); membership.add(`${group}:${user}`);
+    const session = await login();
+    const preview = await upload(session);
+    expect(preview.status).toBe(200);
+    const data = await preview.json() as { id: string; total: number; skipped: number; from: number };
+    expect(data).toMatchObject({ total: 2, skipped: 1, from: Date.parse('2019-08-05T12:15:00+09:00') });
+    expect(await env.DB.prepare('SELECT count(*) AS n FROM messages WHERE import_id IS NOT NULL').first('n')).toBe(0);
+    const proceed = () => call(`/api/imports/${data.id}/continue`, mutation(session));
+    expect(await (await proceed()).json()).toMatchObject({ total: 2, cursor: 2, inserted: 2, done: true });
+    const row = await env.DB.prepare('SELECT * FROM messages WHERE import_id = ? ORDER BY sent_at').bind(data.id).first();
+    expect(row).toMatchObject({ user_id: null, sender_name: '山田', conversation_id: group, source_line: 5, text: 'こんにちは', webhook_event_id: null });
+    const jobs = await env.DB.prepare('SELECT count(*) AS n FROM knowledge_jobs j JOIN messages m USING(message_id) WHERE m.import_id = ?').bind(data.id).first('n');
+    expect(jobs).toBe(2);
+    expect((await upload(session)).status).toBe(200);
+    expect(await (await proceed()).json()).toMatchObject({ inserted: 2, done: true });
+    // A different export header gives another file identity but the same message identities.
+    const second = await (await upload(session, exportText.replace('13:15', '13:16'))).json() as { id: string };
+    expect(await (await call(`/api/imports/${second.id}/continue`, mutation(session))).json()).toMatchObject({ inserted: 0, done: true });
+  });
+  it("requires session, CSRF, live membership, and import ownership", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`);
+    const session = await login();
+    expect((await call('/api/imports', { method: 'POST' })).status).toBe(401);
+    expect((await call('/api/imports', { method: 'POST', headers: { Cookie: session.cookie }, body: exportText })).status).toBe(403);
+    expect((await upload(session, exportText, hiddenGroup)).status).toBe(403);
+    const data = await (await upload(session)).json() as { id: string };
+    loginUser = other; membership.add(`${group}:${other}`); const another = await login();
+    expect((await call(`/api/imports/${data.id}/continue`, mutation(another))).status).toBe(404);
+    membership.delete(`${group}:${user}`);
+    expect((await call(`/api/imports/${data.id}/continue`, mutation(session))).status).toBe(403);
+    expect(await env.DB.prepare('SELECT count(*) AS n FROM messages WHERE import_id IS NOT NULL').first('n')).toBe(0);
+  });
+  it("resumes batches safely after duplicate concurrent requests", async () => {
+    await seen(group); membership.add(`${group}:${user}`); const session = await login();
+    const text = '[LINE] グループのトーク履歴\n2020/01/02(木)\n' + Array.from({ length: 205 }, (_, i) => `10:00\t名前\t発言${i}`).join('\n');
+    const data = await (await upload(session, text)).json() as { id: string };
+    const proceed = () => call(`/api/imports/${data.id}/continue`, mutation(session));
+    expect(await (await proceed()).json()).toMatchObject({ cursor: 100, done: false });
+    await Promise.all([proceed(), proceed()]);
+    const end = await (await proceed()).json();
+    expect(end).toMatchObject({ cursor: 205, inserted: 205, done: true });
+  });
+  it("rejects invalid formats and oversized uploads without creating imports", async () => {
+    await seen(group); membership.add(`${group}:${user}`); const session = await login();
+    expect((await upload(session, 'not a LINE export')).status).toBe(400);
+    expect((await upload(session, 'x'.repeat(2 * 1024 * 1024 + 1))).status).toBe(413);
+    expect(await env.DB.prepare('SELECT count(*) AS n FROM history_imports').first('n')).toBe(0);
   });
 });

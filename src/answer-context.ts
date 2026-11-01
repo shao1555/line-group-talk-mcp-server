@@ -45,7 +45,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
 
   // Explicit quotations outrank recency and semantic similarity, including old messages.
   const quoted = await env.DB.prepare(`SELECT p.message_id, substr(COALESCE(p.text,
-      CASE WHEN j.status = 'ready' THEN j.extracted_text END), 1, 1200) AS text, p.sent_at, p.user_id
+      CASE WHEN j.status = 'ready' THEN j.extracted_text END), 1, 1200) AS text, p.sent_at, COALESCE(p.user_id, '書き出し表示名: ' || p.sender_name) AS user_id
     FROM messages q JOIN messages p ON p.message_id = q.quoted_message_id
     LEFT JOIN knowledge_jobs j ON j.message_id = p.message_id
     WHERE q.message_id = ? AND q.conversation_id = ? AND p.conversation_id = ?
@@ -56,7 +56,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
 
   // Recent raw utterances must not depend on asynchronous embedding/index visibility.
   // Exclude bot-directed questions from evidence; they are requests, not known facts.
-  const recent = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, m.user_id
+  const recent = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
     FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_type = 'text'
     AND m.text IS NOT NULL AND m.message_id != ? AND m.sent_at <= ?
     AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)
@@ -72,7 +72,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
   }
   if (plan?.keyword) {
     const keyword = `%${plan.keyword.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
-    const lexical = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, m.user_id
+    const lexical = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
       FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_id != ?
       AND m.sent_at <= ? AND m.sent_at >= ? AND m.sent_at < ? AND m.text LIKE ? ESCAPE '\\'
       AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)
@@ -81,7 +81,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
     semantic.unshift(...lexical.results.map((row) => ({ messageId: row.message_id, text: row.text, sentAt: row.sent_at, fileName: null, score: 1 })));
   }
   const ids = [...new Set(semantic.map((hit) => hit.messageId))];
-  const allowed = ids.length ? await env.DB.prepare(`SELECT m.message_id, m.user_id FROM messages m
+  const allowed = ids.length ? await env.DB.prepare(`SELECT m.message_id, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id FROM messages m
     WHERE m.message_id IN (${ids.map(() => "?").join(",")}) AND m.conversation_id = ? AND m.unsent_at IS NULL
     AND m.sent_at <= ? AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)`)
     .bind(...ids, conversationId, anchor.sent_at).all<{ message_id: string; user_id: string | null }>() : { results: [] };
@@ -96,7 +96,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
   for (const hit of semantic) {
     if (seenAnchors.has(hit.messageId)) continue;
     seenAnchors.add(hit.messageId);
-    const window = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, m.user_id
+    const window = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
       FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_type = 'text'
       AND m.text IS NOT NULL AND m.message_id != ? AND m.sent_at BETWEEN ? AND ? AND m.sent_at <= ?
       AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)

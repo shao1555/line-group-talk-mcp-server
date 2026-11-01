@@ -61,7 +61,7 @@ async function serveMcp(request: Request, env: Env, ctx: ExecutionContext, princ
       annotations: { readOnlyHint: true, destructiveHint: false },
     }, async ({ conversationId, limit }) => {
       if (!principal.conversationIds.includes(conversationId)) return { isError: true, content: [{ type: "text", text: "このトークへのアクセス権がありません。" }] };
-      const messages = await env.DB.prepare(`SELECT message_id, user_id, message_type, substr(text, 1, 2000) AS text, sent_at
+      const messages = await env.DB.prepare(`SELECT message_id, user_id, sender_name, import_id, message_type, substr(text, 1, 2000) AS text, sent_at
         FROM messages WHERE conversation_id = ? AND unsent_at IS NULL ORDER BY sent_at DESC LIMIT ?`).bind(conversationId, limit).all();
       return { content: [{ type: "text", text: JSON.stringify(messages.results.reverse()) }] };
     });

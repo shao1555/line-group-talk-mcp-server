@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | [0001](0001-cloudflare-platform.md) | Workers / D1 / Vectorize と共通ナレッジ | 採用 |
 | [0002](0002-on-demand-knowledge.md) | ナレッジ整理は明示起動するスキル | 採用・実装予定 |
-| [0003](0003-history-import.md) | 過去ログはテキスト書き出しを優先 | 採用・実装予定 |
+| [0003](0003-history-import.md) | 過去ログはテキスト書き出しを優先 | 採用・テキスト取り込み実装済み |
 | [0004](0004-line-webhook-mvp.md) | 最初の bot は記録と ping / pong | 採用 |
 | [0005](0005-attachment-storage.md) | 添付を非公開 R2 に非同期保存する | 採用 |
 | [0006](0006-automatic-knowledge-indexing.md) | 安価なモデルで自動解析し Vectorize に索引化する | 採用 |
