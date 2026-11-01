@@ -1,9 +1,12 @@
+import { cancellationStatements, enqueueKnowledge, markForIndex } from "./knowledge";
+
 export type AttachmentJob = { messageId: string };
 export type MediaMessage = {
   id: string;
   type: string;
   fileName?: string;
   fileSize?: number;
+  duration?: number;
   contentProvider?: { type: string };
 };
 
@@ -39,14 +42,15 @@ export async function recordAttachment(message: MediaMessage, sourceType: string
   const external = message.contentProvider && message.contentProvider.type !== "line";
   const key = ["line", sourceType, conversationId, message.id].map(encodeURIComponent).join("/");
   await env.DB.prepare(`
-    INSERT INTO attachments (message_id, object_key, file_name, declared_size, status, last_error_code)
+    INSERT INTO attachments (message_id, object_key, file_name, declared_size, duration_ms, status, last_error_code)
     SELECT message_id, ?, CASE WHEN unsent_at IS NULL THEN ? ELSE NULL END,
+      CASE WHEN unsent_at IS NULL THEN ? ELSE NULL END,
       CASE WHEN unsent_at IS NULL THEN ? ELSE NULL END,
       CASE WHEN unsent_at IS NOT NULL THEN 'delete_pending' WHEN ? THEN 'failed' ELSE 'pending' END,
       CASE WHEN unsent_at IS NULL AND ? THEN 'external_content_not_supported' ELSE NULL END
     FROM messages WHERE message_id = ?
     ON CONFLICT(message_id) DO NOTHING
-  `).bind(key, message.fileName ?? null, message.fileSize ?? null, !!external, !!external, message.id).run();
+  `).bind(key, message.fileName ?? null, message.fileSize ?? null, message.duration ?? null, !!external, !!external, message.id).run();
   const row = await env.DB.prepare("SELECT status FROM attachments WHERE message_id = ?")
     .bind(message.id).first<{ status: string }>();
   if (row?.status === "pending" || row?.status === "delete_pending") await enqueueAttachment(message.id, env);
@@ -59,10 +63,12 @@ export async function cancelAttachment(messageId: string, timestamp: number, env
       .bind(messageId, timestamp),
     env.DB.prepare("UPDATE messages SET text = NULL, unsent_at = ? WHERE message_id = ?").bind(timestamp, messageId),
     env.DB.prepare(`UPDATE attachments SET status = 'delete_pending',
-      file_name = NULL, declared_size = NULL, content_type = NULL, size_bytes = NULL,
+      file_name = NULL, declared_size = NULL, content_type = NULL, size_bytes = NULL, duration_ms = NULL,
       last_error_code = NULL, queued_at = NULL WHERE message_id = ? AND status != 'deleted'`).bind(messageId),
+    ...cancellationStatements(messageId, env),
   ]);
   if (results[2].meta.changes) await enqueueAttachment(messageId, env);
+  await enqueueKnowledge(messageId, env);
 }
 
 async function load(messageId: string, env: Env): Promise<Attachment | null> {
@@ -73,7 +79,7 @@ async function load(messageId: string, env: Env): Promise<Attachment | null> {
 
 async function remove(row: Attachment, env: Env): Promise<void> {
   await env.ATTACHMENTS.delete(row.object_key);
-  await env.DB.prepare(`UPDATE attachments SET status = 'deleted', file_name = NULL, declared_size = NULL,
+  await env.DB.prepare(`UPDATE attachments SET status = 'deleted', file_name = NULL, declared_size = NULL, duration_ms = NULL,
     content_type = NULL, size_bytes = NULL, last_error_code = NULL, deleted_at = ? WHERE message_id = ?`)
     .bind(Date.now(), row.message_id).run();
 }
@@ -174,6 +180,7 @@ async function finishStorage(row: Attachment, size: number, contentType: string,
   // Unsend may arrive during either the download or the R2 write.
   const current = await load(messageId, env);
   if (current && current.unsent_at !== null) await remove(current, env);
+  else await markForIndex(messageId, env);
 }
 
 export async function consumeAttachments(batch: MessageBatch<AttachmentJob>, env: Env): Promise<void> {

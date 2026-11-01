@@ -4,10 +4,24 @@
 	"account_id": "00000000000000000000000000000000",
 	// Latest date supported by the workerd bundled with the pinned toolchain.
 	"compatibility_date": "2026-10-30",
-	"vars": { "MAX_ATTACHMENT_BYTES": "104857600" },
+	"compatibility_flags": ["nodejs_compat"],
+	"vars": {
+		"MAX_ATTACHMENT_BYTES": "104857600",
+		"AI_MONTHLY_BUDGET_USD": "5",
+		"AI_DAILY_IMAGES": "20",
+		"AI_DAILY_AUDIO_SECONDS": "3600",
+		"AI_DAILY_EMBEDDING_BYTES": "500000",
+		"AI_DAILY_ANSWERS": "100",
+		"AI_MAX_AUDIO_SECONDS": "600"
+	},
+	"ai": { "binding": "AI" },
+	"vectorize": [{ "binding": "KNOWLEDGE", "index_name": "line-group-talk-knowledge" }],
 	"r2_buckets": [{ "binding": "ATTACHMENTS", "bucket_name": "line-group-talk-attachments" }],
 	"queues": {
-		"producers": [{ "binding": "ATTACHMENT_QUEUE", "queue": "line-group-talk-attachments" }],
+		"producers": [
+			{ "binding": "ATTACHMENT_QUEUE", "queue": "line-group-talk-attachments" },
+			{ "binding": "KNOWLEDGE_QUEUE", "queue": "line-group-talk-knowledge" }
+		],
 		"consumers": [{
 			"queue": "line-group-talk-attachments",
 			"max_batch_size": 1,
@@ -15,6 +29,13 @@
 			"max_concurrency": 1,
 			"max_retries": 5,
 			"dead_letter_queue": "line-group-talk-attachments-dlq"
+		}, {
+			"queue": "line-group-talk-knowledge",
+			"max_batch_size": 1,
+			"max_batch_timeout": 1,
+			"max_concurrency": 1,
+			"max_retries": 2,
+			"dead_letter_queue": "line-group-talk-knowledge-dlq"
 		}]
 	},
 	"triggers": { "crons": ["*/5 * * * *"] },

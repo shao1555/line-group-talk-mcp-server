@@ -19,8 +19,8 @@ LINE グループの会話を記録し、グループ内の活動支援と外部
 - 送信取消・訂正は、原文と派生ナレッジ・検索索引に反映する。
 - 過去ログの表示名と LINE ユーザーIDは、根拠なく同一人物として扱わない。
 
-現在は、署名検証付き Webhook、D1 への発言保存、`ping` → `pong`、添付の R2 保存、送信取消による本文・添付削除を実装している。
-MCP・Vectorize・ナレッジ整理・過去ログ取り込みは今後実装する。
+現在は、署名検証付き Webhook、D1 への発言保存、`ping` → `pong`、添付の R2 保存、OCR・画像説明・文字起こし、Vectorize 検索、認証付き MCP、メンション回答を実装している。
+送信取消は本文・添付・抽出文・検索索引に反映する。会話全体の要約・決定事項の整理・過去ログ取り込みは今後実装する。
 
 設計判断と今回の範囲は [ADR 一覧](docs/adr/README.md) を参照。
 
@@ -67,7 +67,8 @@ mise exec -- npm run types
 mise exec -- npm run check
 ```
 
-テストはローカルの Workers / D1 実行環境を使い、LINE API への送信をモックする。実際のチャットには投稿しない。
+テストはローカルの Workers / D1 / R2 実行環境を使い、LINE API・AI・Vectorize をモックする。実際のチャットには投稿せず、有料 AI 呼び出しも行わない。
+`wrangler dev` で AI / Vectorize を使う場合は、リモートのリソース・有料推論に接続する点に注意する。通常のローカル D1 / R2 データとは別。
 固定した workerd が対応する日付に合わせ、互換日付は `2026-10-30` としている。
 
 ## Cloudflare / LINE への接続
@@ -111,7 +112,7 @@ mise exec -- wrangler d1 execute DB --remote --command 'SELECT count(*) AS messa
 - 取消時は D1 上で直ちに削除待ちにし、R2 実体は非同期削除する。保存中の取消・再送でも復活しないよう最新状態を確認する。
 - 削除失敗は `delete_pending` のまま再試行する。取得失敗が上限に達した場合は DLQ と `last_error_code` を確認する。
 - LINE 側で取得期限を過ぎた添付は保存できない。過去に受信した添付の遡及取得、外部 content provider、アルバム・ノートは対象外。
-- OCR・画像理解などの AI 処理は行わない。
+- 保存完了後に解析キューへ渡し、処理上限内で OCR・画像説明・文字起こし・本文抽出を行う。
 
 本文やファイル名を出さずに保存状態を確認する：
 
@@ -121,3 +122,78 @@ mise exec -- wrangler d1 execute DB --remote --command 'SELECT m.message_id, m.s
 
 取得が `failed` になった場合、認証・サイズ制限などの原因を修正後、対象の `attachments` 行を `status = 'pending', queued_at = NULL` に戻せば Cron が再投入する。
 DLQ は Cloudflare Dashboard の Queues で確認する。削除待ちが長時間残る場合も運用確認が必要。
+
+## ナレッジ解析と検索
+
+発言と保存済み添付は `line-group-talk-knowledge` Queue で処理する。既存の有効な発言・保存済み添付も取り込み対象。
+抽出文・埋め込みは D1 に保持し、Vectorize の namespace を会話IDで分ける。検索結果を返す前に D1 の会話ID・取消状態を確認する。
+解析・索引の反映は非同期なので、送信直後には検索できない場合がある。
+
+| 対象 | 処理 |
+| --- | --- |
+| 発言・UTF-8 テキスト・CSV・JSON | 本文を分割して BGE-M3 で埋め込み |
+| JPEG / PNG / WebP | Mistral Small 3.1 で文字抽出と短い画像説明 |
+| 音声・動画 | Whisper Large V3 Turbo で日本語文字起こし。LINE から取得できる時間が必要 |
+| PDF・対応 Office 文書 | Markdown Conversion で本文抽出。本文なしの PDF は上限付き画像変換も実施 |
+
+文字起こしはコンテナ・コーデックによって失敗する場合がある。時間不明の音声ファイル、暗号化PDF、非対応形式は原本だけ保存する。
+低価格モデルを使うため、OCR・説明・文字起こしには誤りがあり得る。
+
+既定の上限（`wrangler.jsonc` の変数で変更）：
+
+| 設定 | 既定値 |
+| --- | --- |
+| AI の月予算見積り | $5（`AI_MONTHLY_BUDGET_USD`、0ならモデル呼び出しを保留） |
+| 日次画像処理 | 20件、PDFの画像変換はページ数換算 |
+| 日次文字起こし | 60分 |
+| 日次埋め込み入力 | 500,000 UTF-8 bytes |
+| 日次メンション回答モデル呼び出し | 100回（1質問につき最大2回） |
+| 解析対象のファイル | 10 MiBまで、画像4 MiBまで、PDF10ページまで、音声・動画10分まで |
+| 抽出文 | 40,000文字まで。打ち切りは抽出文に明記 |
+
+日・月の境界は UTC。アプリ側でモデル呼び出し前に料金枠を予約し、上限で `budget_wait` にする。
+予算待ちは Cron で再確認し、記録・原本保存は継続する。失敗・応答不明の呼び出しも費用枠を消費する扱い。
+公開単価を基にした保守的な見積りであり、Cloudflare の請求を強制制限するものではない。無料枠の控除、料金改定、R2 / D1 / Queues / Vectorize の料金は含めない。
+
+```sh
+mise exec -- wrangler d1 execute DB --remote --command 'SELECT status, count(*) AS count FROM knowledge_jobs GROUP BY status;'
+mise exec -- wrangler d1 execute DB --remote --command 'SELECT month, kind, sum(charged_microusd) / 1000000.0 AS estimated_usd FROM ai_usage GROUP BY month, kind;'
+```
+
+`failed` の原因を修正して再処理する場合は、対象の `knowledge_jobs` の `status = 'pending', next_attempt_at = 0, queued_at = NULL` と該当段階の試行回数をリセットする。
+既存の抽出文・埋め込みは再利用する。モデル・処理バージョンを変更する場合は、対象のキャッシュ・チャンクと索引を再構築する。
+
+## 外部セッションからの検索
+
+未認証の `/search` と `/mcp` は拒否する。参照可能なグループを指定してトークンを発行する：
+
+```sh
+mise exec -- node scripts/create-search-client.mjs --conversation C0123456789abcdef0123456789abcdef
+mise exec -- node scripts/search.mjs '集合場所は？'
+```
+
+`--conversation` は繰り返し指定できる。実際の会話IDは D1 の `messages.conversation_id` で確認する。
+トークンは Git 対象外の `data/search-client.json` に保存し、サーバーにはハッシュのみ登録する。既存ファイルを自動上書きしない。
+他人に渡すトークンは、その人が参照してよいグループだけに制限する。トークンを失効させるには対象の `search_clients.revoked_at` を設定する。
+
+- HTTP：`POST /search`、`Authorization: Bearer <token>`、JSON `{ "query": "...", "conversationId": "..." }`
+- MCP：`https://legacy.example.com/mcp` に同じ Bearer ヘッダーで接続
+- MCP ツール：`search_knowledge`、`list_conversations`
+
+## LINE での質問
+
+LINE のメンション操作で bot を選び、`@bot 集合場所はどこ？` のように送る。
+単に表示名を文字として打つだけではメンションにならない。
+bot の回答に LINE のリプライ機能で返信すると、メンションなしでも会話を続けられる（対応後に送られた bot の回答が対象）。
+ただし bot の回答へのリプライでも、他人へのメンションが含まれていれば返答しない。
+他人の発言にリプライしながら bot をメンションすると、引用先の発言や解析済みの添付内容を優先して参照する。
+同じグループの発言・添付の抽出文だけを検索し、資料番号付きの短い回答を返す。
+記録だけで足りない説明やおすすめはモデルの一般知識で具体化し、記録の事実と一般的な提案を区別する。Web 検索は行わない。
+個人の旅行先・贈り物の日付などは記録の根拠が必要で、一般知識から推測しない。
+直近20件のテキストは D1 から直接読み、検索で見つかった発言の前後も補う。
+過去の質問で根拠が不足すると、モデルが検索語・人名等のキーワード・必要な発言期間を選び、1回だけ追加検索する。
+「去年」は質問日時を基準にするが、出来事の時期と発言日時を区別する。期間内で見つからなければ全期間へ広げる。
+bot 宛てのメンションや bot の回答へのリプライ以外には回答しない。処理上限・一時的な障害は固定文で通知する。
+
+回答生成は記録後にバックグラウンドで行い、reply token は保存しない。通信遅延や期限切れによって返信できない場合がある。
+会話全体の要約は行わない。元発言の取消後、既に LINE に送信済みの回答自体を自動で取り消すことはできない。

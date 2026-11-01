@@ -1,5 +1,10 @@
 import { cancelAttachment, consumeAttachments, recordAttachment, repairAttachmentJobs } from "./attachments";
 import type { MediaMessage, AttachmentJob } from "./attachments";
+import { consumeKnowledge, markForIndex, repairKnowledgeJobs } from "./knowledge";
+import { handleSearch } from "./search";
+import { handleMcp } from "./mcp";
+import { answerMention, mentionQuestion, type Mention } from "./mentions";
+import { readLimitedBody } from "./http";
 
 type Source = { type: "group" | "room" | "user"; groupId?: string; roomId?: string; userId?: string };
 type LineEvent = {
@@ -9,32 +14,11 @@ type LineEvent = {
   source: Source;
   replyToken?: string;
   mode?: string;
-  message?: MediaMessage & { text?: string };
+  message?: MediaMessage & { text?: string; quotedMessageId?: string; quoteToken?: string; mention?: { mentionees?: Mention[] } };
   unsend?: { messageId: string };
 };
 
 const MAX_BODY_BYTES = 1024 * 1024;
-
-async function readBody(request: Request): Promise<Uint8Array> {
-  const reader = request.body?.getReader();
-  if (!reader) return new Uint8Array();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > MAX_BODY_BYTES) {
-      await reader.cancel();
-      throw new RangeError("Webhook body too large");
-    }
-    chunks.push(value);
-  }
-  const body = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
-  return body;
-}
 
 async function validSignature(body: Uint8Array, signature: string, secret: string): Promise<boolean> {
   try {
@@ -46,7 +30,7 @@ async function validSignature(body: Uint8Array, signature: string, secret: strin
   } catch { return false; }
 }
 
-async function processEvent(event: LineEvent, env: Env): Promise<void> {
+async function processEvent(event: LineEvent, env: Env, ctx?: ExecutionContext): Promise<void> {
   if (event.type === "unsend" && event.unsend) {
     await cancelAttachment(event.unsend.messageId, event.timestamp, env);
     return;
@@ -58,18 +42,40 @@ async function processEvent(event: LineEvent, env: Env): Promise<void> {
 
   await env.DB.prepare(`
     INSERT INTO messages
-      (message_id, webhook_event_id, source_type, conversation_id, user_id, message_type, text, sent_at, received_at, unsent_at)
-    SELECT ?, ?, ?, ?, ?, ?, CASE WHEN u.unsent_at IS NULL THEN ? ELSE NULL END, ?, ?, u.unsent_at
+      (message_id, webhook_event_id, source_type, conversation_id, user_id, message_type, text, sent_at, received_at, unsent_at, quoted_message_id)
+    SELECT ?, ?, ?, ?, ?, ?, CASE WHEN u.unsent_at IS NULL THEN ? ELSE NULL END, ?, ?, u.unsent_at, ?
     FROM (SELECT 1) LEFT JOIN unsent_messages u ON u.message_id = ?
     ON CONFLICT DO NOTHING
   `).bind(message.id, event.webhookEventId, source.type, conversationId, source.userId ?? null,
     message.type, message.type === "text" ? message.text ?? null : null,
-    event.timestamp, Date.now(), message.id).run();
+    event.timestamp, Date.now(), typeof message.quotedMessageId === "string" ? message.quotedMessageId : null, message.id).run();
 
   await recordAttachment(message, source.type, conversationId, env);
+  if (message.type === "text") await markForIndex(message.id, env);
 
   const stored = await env.DB.prepare("SELECT text, unsent_at, replied_at FROM messages WHERE message_id = ?")
     .bind(message.id).first<{ text: string | null; unsent_at: number | null; replied_at: number | null }>();
+  if (stored?.text && stored.unsent_at === null && stored.replied_at === null && event.replyToken && event.mode !== "standby") {
+    const mentions = message.mention?.mentionees ?? [];
+    let question = mentionQuestion(stored.text, mentions);
+    if (typeof message.quotedMessageId === "string") {
+      const parent = await env.DB.prepare(`SELECT b.message_id FROM bot_replies b JOIN messages m USING(message_id)
+        WHERE b.line_message_id = ? AND b.status = 'sent' AND b.text IS NOT NULL
+        AND m.conversation_id = ? AND m.unsent_at IS NULL`)
+        .bind(message.quotedMessageId, conversationId).first();
+      if (parent) {
+        // An explicit human addressee takes precedence over continuing a bot reply.
+        if (mentions.some((mention) => mention.type === "user" && mention.isSelf !== true)) question = null;
+        else if (question === null) question = stored.text.slice(0, 2000);
+      }
+    }
+    if (question !== null) {
+      const response = answerMention(message.id, question, conversationId, event.replyToken, env, message.quoteToken);
+      if (ctx) ctx.waitUntil(response);
+      else await response;
+      return;
+    }
+  }
   if (!stored || stored.text !== "ping" || stored.unsent_at !== null || stored.replied_at !== null
     || !event.replyToken || event.mode === "standby") return;
 
@@ -87,14 +93,21 @@ async function processEvent(event: LineEvent, env: Env): Promise<void> {
 
 export default {
   async queue(batch: MessageBatch<AttachmentJob>, env: Env): Promise<void> {
-    await consumeAttachments(batch, env);
+    if (batch.queue === "line-group-talk-knowledge") await consumeKnowledge(batch, env);
+    else await consumeAttachments(batch, env);
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await repairAttachmentJobs(env);
+    await repairKnowledgeJobs(env);
   },
-  async fetch(request, env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/health" && request.method === "GET") return Response.json({ ok: true });
+    if (path === "/search") return handleSearch(request, env);
+    if (path === "/mcp") {
+      if (!ctx) return new Response("Execution context required", { status: 500 });
+      return handleMcp(request, env, ctx);
+    }
     if (path !== "/webhook") return new Response("Not found", { status: 404 });
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
     if (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN) {
@@ -103,7 +116,7 @@ export default {
     const signature = request.headers.get("x-line-signature");
     if (!signature) return new Response("Invalid signature", { status: 401 });
     let body: Uint8Array;
-    try { body = await readBody(request); }
+    try { body = await readLimitedBody(request, MAX_BODY_BYTES); }
     catch { return new Response("Payload too large", { status: 413 }); }
     if (!await validSignature(body, signature, env.LINE_CHANNEL_SECRET)) {
       return new Response("Invalid signature", { status: 401 });
@@ -116,7 +129,7 @@ export default {
     try {
       // Await persistence and the short reply so failures are visible to LINE redelivery.
       // Do not store/log raw events: they contain message text and reply tokens.
-      for (const event of payload.events) await processEvent(event, env);
+      for (const event of payload.events) await processEvent(event, env, ctx);
       return Response.json({ ok: true });
     } catch {
       console.error(JSON.stringify({ event: "webhook_processing_failed" }));
