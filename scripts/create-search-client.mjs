@@ -18,5 +18,5 @@ const sql = `INSERT INTO search_clients(token_hash, label, conversation_ids) VAL
 const result = spawnSync("mise", ["exec", "--", "wrangler", "d1", "execute", "DB", "--remote", "--command", sql], { encoding: "utf8" });
 if (result.status !== 0) throw new Error("Failed to register search client. Check Wrangler authentication and migrations.");
 await mkdir(resolve("data"), { recursive: true });
-await writeFile(path, JSON.stringify({ endpoint: "https://legacy.example.com", token, conversationIds: JSON.parse(ids) }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+await writeFile(path, JSON.stringify({ endpoint: "https://line-talk.example.com", token, conversationIds: JSON.parse(ids) }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
 console.log(`Search credentials saved to ${path}. Keep this file private; the server stores only the token hash.`);

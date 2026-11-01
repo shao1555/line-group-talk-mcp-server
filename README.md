@@ -165,6 +165,63 @@ mise exec -- wrangler d1 execute DB --remote --command 'SELECT month, kind, sum(
 
 ## 外部セッションからの検索
 
+### LINE ログインのポータル
+
+`https://line-talk.example.com/` で LINE ログインし、本人と bot が参加しているトークを確認できる。
+MCP クライアントに `https://line-talk.example.com/mcp` を追加すると、OAuth / DCR によりブラウザーで接続を許可できる。トークンの手動発行は不要。
+接続は本人に紐付き、本人と bot が現在ともに参加しているすべての把握済みトークを参照できる。トークの選別・検索は手元のエージェントがツールで行う。
+後から参加したトークも自動で対象になり、退会や bot の退出後は対象から外れる。接続アプリの一覧・解除はポータルから行える。
+LINE API で参加確認できないときはアクセスを許可しない。過去の発言者一覧をアクセス権として流用しない。
+
+LINE Developers Console で、Messaging API と**同じプロバイダー**に LINE Login チャンネル（ウェブアプリ）を作成する。
+LINEログイン設定のコールバック URL は次の値を登録する。
+
+```text
+https://line-talk.example.com/auth/line/callback
+```
+
+旧 `workers.dev` URL も互換用に稼働する。既存接続を残す場合は旧コールバック URL も削除しない。新ドメインでは OAuth issuer / resource が変わるため、MCP クライアントには新 URL を追加して再認可する。LINE Webhook の URL は変更不要。
+
+チャンネルIDは `wrangler.jsonc` の `LINE_LOGIN_CHANNEL_ID` に設定し、secret は次で登録する。
+
+```sh
+mise exec -- wrangler secret put LINE_LOGIN_CHANNEL_SECRET
+```
+
+スコープは `openid profile`。開発中のチャンネルはチャンネルの開発メンバーでテストし、一般利用者への公開時にチャンネルを公開する。
+LINE Login では所属グループ全体を取得できないため、bot が把握しているトーク（初期実装は直近100件まで）を参加確認の候補にする。
+一覧にない場合は bot を招待してグループで発言し、「更新」を押す。詳細は [ADR 0008](docs/adr/0008-line-login-portal.md)。
+
+初めて使う人は [公式アカウントを友だち追加](https://lin.ee/EXAMPLE) し、対象グループに bot を招待する。ポータルにも追加用 QR コードと招待の案内を設置している。
+
+OAuth 認可サーバーは `@cloudflare/workers-oauth-provider` と `OAUTH_KV` を使う。MCP クライアントの同意を得てから LINE に遷移し、認可コードとトークンを発行する。PKCE S256 が必要。アクセストークンは1時間、接続・更新トークンは30日間で、更新トークンはローテーションする。
+
+| 用途 | パス |
+| --- | --- |
+| MCP 接続先 | `/mcp` |
+| 保護リソースメタデータ | `/.well-known/oauth-protected-resource/mcp` |
+| OAuth サーバーメタデータ | `/.well-known/oauth-authorization-server` |
+| 動的クライアント登録 | `/oauth/register` |
+| 接続の同意 | `/authorize` |
+| トークン交換・更新 | `/oauth/token` |
+
+MCP ツールは次を公開する。
+
+- `list_conversations`：参加トークのID・名前・記録件数・記録の開始/終了日時。
+- `search_knowledge`：トークを指定した意味検索。任意の発言日時範囲 `from` / `before`（Unixミリ秒）に対応。
+- `get_recent_messages`：指定トークの直近の未取消メッセージを時系列で取得。
+
+### Cloudflare の API クライアント向け設定
+
+`workers.dev` では共有の Browser Integrity Check により Python の標準 User-Agent などが Error 1010 になることがある。新ドメインでも既定のゾーン設定によって同じ制限があるため、Cloudflare の `example.com` → Rules → Configuration Rules に次を設定する。
+
+- 条件: `http.host eq "line-talk.example.com"`
+- 設定: Browser Integrity Check を Off
+
+この設定は Wrangler の OAuth 権限では編集できないためダッシュボードで管理する。ドメイン全体の設定は変更しない。設定後、標準 User-Agent の Python `urllib.request.urlopen("https://line-talk.example.com/.well-known/oauth-authorization-server")` が 200、未認証の `/mcp` が OAuth の 401 を返すことを確認する。詳細は [ADR 0009](docs/adr/0009-custom-domain.md)。
+
+### 運用者の固定スコープトークン
+
 未認証の `/search` と `/mcp` は拒否する。参照可能なグループを指定してトークンを発行する：
 
 ```sh
@@ -177,8 +234,8 @@ mise exec -- node scripts/search.mjs '集合場所は？'
 他人に渡すトークンは、その人が参照してよいグループだけに制限する。トークンを失効させるには対象の `search_clients.revoked_at` を設定する。
 
 - HTTP：`POST /search`、`Authorization: Bearer <token>`、JSON `{ "query": "...", "conversationId": "..." }`
-- MCP：`https://legacy.example.com/mcp` に同じ Bearer ヘッダーで接続
-- MCP ツール：`search_knowledge`、`list_conversations`
+- MCP：`https://line-talk.example.com/mcp` に同じ Bearer ヘッダーで接続
+- 管理用トークンでは認可済みの固定スコープを維持する。通常利用者はポータルの OAuth 接続を使う。
 
 ## LINE での質問
 

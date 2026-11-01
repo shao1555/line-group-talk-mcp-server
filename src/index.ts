@@ -2,9 +2,13 @@ import { cancelAttachment, consumeAttachments, recordAttachment, repairAttachmen
 import type { MediaMessage, AttachmentJob } from "./attachments";
 import { consumeKnowledge, markForIndex, repairKnowledgeJobs } from "./knowledge";
 import { handleSearch } from "./search";
-import { handleMcp } from "./mcp";
+import { handleMcp, mcpResource } from "./mcp";
+import { oauthServer } from "./oauth-server";
+import { envForRequest } from "./origins";
 import { answerMention, mentionQuestion, type Mention } from "./mentions";
 import { readLimitedBody } from "./http";
+import { recordConversation } from "./conversations";
+import { handlePortal } from "./portal";
 
 type Source = { type: "group" | "room" | "user"; groupId?: string; roomId?: string; userId?: string };
 type LineEvent = {
@@ -16,6 +20,8 @@ type LineEvent = {
   mode?: string;
   message?: MediaMessage & { text?: string; quotedMessageId?: string; quoteToken?: string; mention?: { mentionees?: Mention[] } };
   unsend?: { messageId: string };
+  joined?: { members?: { userId?: string }[] };
+  left?: { members?: { userId?: string }[] };
 };
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -31,6 +37,7 @@ async function validSignature(body: Uint8Array, signature: string, secret: strin
 }
 
 async function processEvent(event: LineEvent, env: Env, ctx?: ExecutionContext): Promise<void> {
+  await recordConversation(event, env);
   if (event.type === "unsend" && event.unsend) {
     await cancelAttachment(event.unsend.messageId, event.timestamp, env);
     return;
@@ -101,7 +108,13 @@ export default {
     await repairKnowledgeJobs(env);
   },
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    env = envForRequest(request, env);
     const path = new URL(request.url).pathname;
+    if (path.startsWith("/.well-known/oauth-protected-resource") && ctx) return mcpResource(env).fetch(request, env, ctx);
+    if ((path.startsWith("/.well-known/") || path.startsWith("/oauth/")) && ctx) return oauthServer(env).fetch(request, env, ctx);
+    if (["/", "/portal", "/portal.js", "/portal.css", "/authorize"].includes(path) || path.startsWith("/auth/") || path.startsWith("/api/")) {
+      return handlePortal(request, env);
+    }
     if (path === "/health" && request.method === "GET") return Response.json({ ok: true });
     if (path === "/search") return handleSearch(request, env);
     if (path === "/mcp") {

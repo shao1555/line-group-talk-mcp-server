@@ -1,19 +1,23 @@
 import { embed, sha256 } from "./ai";
 import { readLimitedBody } from "./http";
+import { verifyConversationAccess, type AccessibleConversation } from "./conversations";
 
 export type SearchHit = { messageId: string; text: string; sentAt: number; fileName: string | null; score: number };
-export type SearchPrincipal = { conversationIds: string[] };
+export type SearchPrincipal = { conversationIds: string[]; conversations?: AccessibleConversation[] };
 export type SearchRange = { from?: number; before?: number; fallbackToAllTime?: boolean; timeoutMs?: number };
 
 export async function authenticateSearch(request: Request, env: Env): Promise<SearchPrincipal | null> {
   const token = request.headers.get("Authorization")?.match(/^Bearer ([\w-]{32,256})$/)?.[1];
   if (!token) return null;
-  const row = await env.DB.prepare("SELECT conversation_ids FROM search_clients WHERE token_hash = ? AND revoked_at IS NULL")
-    .bind(await sha256(token)).first<{ conversation_ids: string }>();
+  const row = await env.DB.prepare(`SELECT conversation_ids, owner_user_id FROM search_clients
+    WHERE token_hash = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`)
+    .bind(await sha256(token), Date.now()).first<{ conversation_ids: string; owner_user_id: string | null }>();
   if (!row) return null;
   const ids: unknown = JSON.parse(row.conversation_ids);
   if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 64)) return null;
-  return { conversationIds: ids };
+  if (!row.owner_user_id) return { conversationIds: ids };
+  const access = await Promise.all(ids.map((id) => verifyConversationAccess(row.owner_user_id!, id, env)));
+  return { conversationIds: access.filter((item) => item !== null).map((item) => item.id) };
 }
 
 export async function searchKnowledge(query: string, conversationId: string, env: Env, excludeId?: string, limit = 5, range: SearchRange = {}): Promise<SearchHit[]> {
@@ -61,7 +65,9 @@ async function queryAllTime(vector: number[], conversationId: string, env: Env, 
 
 export async function handleSearch(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-  const principal = await authenticateSearch(request, env);
+  let principal: SearchPrincipal | null;
+  try { principal = await authenticateSearch(request, env); }
+  catch { return new Response("Membership verification temporarily unavailable", { status: 503 }); }
   if (!principal) return new Response("Unauthorized", { status: 401 });
   let raw: string;
   try { raw = new TextDecoder().decode(await readLimitedBody(request, 8000)); }
