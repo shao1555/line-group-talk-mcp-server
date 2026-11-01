@@ -1,0 +1,22 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+
+# Local Cloudflare state and secrets
+.wrangler/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Private chat exports and local imports
+data/
+imports/
+exports/
+*.log
+
+# OS files
+.DS_Store
