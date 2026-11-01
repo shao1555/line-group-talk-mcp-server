@@ -73,16 +73,19 @@ mise exec -- npm run check
 
 ## Cloudflare / LINE への接続
 
-対象は `operator@example.com` のアカウント。D1 `line-group-talk` は作成済みで、ID は `wrangler.jsonc` に設定している。
+`wrangler.jsonc` は公開用の設定例です。最初に `cp wrangler.jsonc wrangler.private.jsonc` を実行し、Git 管理外の `wrangler.private.jsonc` に自分のアカウントID・ドメイン・LINE ログインチャンネルID・D1/KV のリソースIDを設定してください。記載した URL と ID は架空の値です。
+`LINE_FRIEND_URL` / `LINE_FRIEND_QR_URL` に公式アカウントの友だち追加リンクと QR 画像 URL を設定できます。未設定時は追加ボタンを表示しません。
+`npm run dev` / `deploy` / `db:local` / `db:remote` はこの非公開設定があれば優先して使用します。`types` / `check` とテストは公開設定を使います。直接 Wrangler を実行するときも `--config wrangler.private.jsonc` を指定してください。
+D1 `line-group-talk` を作成し、発行された ID を非公開設定に設定します。
 ローカルの D1 とリモートの D1 は別のデータベース。
-R2 `line-group-talk-attachments` と Queues `line-group-talk-attachments` / `line-group-talk-attachments-dlq` も作成済み。
+R2 / Queues / Vectorize / KV も自分のアカウントで作成してください。
 リソース名は `wrangler.jsonc` に設定し、ローカル開発・テストではローカルの R2 / Queues を使用する。
 
 ```sh
 mise exec -- npm run db:remote
 mise exec -- npm run deploy
-mise exec -- wrangler secret put LINE_CHANNEL_SECRET
-mise exec -- wrangler secret put LINE_CHANNEL_ACCESS_TOKEN
+mise exec -- node scripts/wrangler.mjs secret put LINE_CHANNEL_SECRET
+mise exec -- node scripts/wrangler.mjs secret put LINE_CHANNEL_ACCESS_TOKEN
 ```
 
 `secret put` の対話入力に値を入れる。秘密情報は Wrangler のログイン情報とは別で、`.dev.vars` はデプロイ時に自動アップロードされない。
@@ -182,17 +185,17 @@ https://line-talk.example.com/auth/line/callback
 
 旧 `workers.dev` URL も互換用に稼働する。既存接続を残す場合は旧コールバック URL も削除しない。新ドメインでは OAuth issuer / resource が変わるため、MCP クライアントには新 URL を追加して再認可する。LINE Webhook の URL は変更不要。
 
-チャンネルIDは `wrangler.jsonc` の `LINE_LOGIN_CHANNEL_ID` に設定し、secret は次で登録する。
+チャンネルIDは `wrangler.private.jsonc` の `LINE_LOGIN_CHANNEL_ID` に設定し、secret は次で登録する。
 
 ```sh
-mise exec -- wrangler secret put LINE_LOGIN_CHANNEL_SECRET
+mise exec -- node scripts/wrangler.mjs secret put LINE_LOGIN_CHANNEL_SECRET
 ```
 
 スコープは `openid profile`。開発中のチャンネルはチャンネルの開発メンバーでテストし、一般利用者への公開時にチャンネルを公開する。
 LINE Login では所属グループ全体を取得できないため、bot が把握しているトーク（初期実装は直近100件まで）を参加確認の候補にする。
 一覧にない場合は bot を招待してグループで発言し、「更新」を押す。詳細は [ADR 0008](docs/adr/0008-line-login-portal.md)。
 
-初めて使う人は [公式アカウントを友だち追加](https://lin.ee/EXAMPLE) し、対象グループに bot を招待する。ポータルにも追加用 QR コードと招待の案内を設置している。
+初めて使う人は [公式アカウントを友だち追加](（非公開設定の LINE_FRIEND_URL）) し、対象グループに bot を招待する。ポータルにも追加用 QR コードと招待の案内を設置している。
 
 OAuth 認可サーバーは `@cloudflare/workers-oauth-provider` と `OAUTH_KV` を使う。MCP クライアントの同意を得てから LINE に遷移し、認可コードとトークンを発行する。PKCE S256 が必要。アクセストークンは1時間、接続・更新トークンは30日間で、更新トークンはローテーションする。
 
@@ -323,3 +326,15 @@ bot 宛てのメンションや bot の回答へのリプライ以外には回�
 
 回答生成は記録後にバックグラウンドで行い、reply token は保存しない。通信遅延や期限切れによって返信できない場合がある。
 会話全体の要約は行わない。元発言の取消後、既に LINE に送信済みの回答自体を自動で取り消すことはできない。
+
+## ライセンス
+
+Copyright (c) 2026 shao.
+
+[GNU Affero General Public License v3.0 only](LICENSE)（`AGPL-3.0-only`）。
+
+## 個人情報の扱い
+
+実際の設定、秘密情報、チャット履歴、評価結果は Git に追加しないでください。
+`wrangler.private.jsonc`、`.dev.vars`、`data/`、`imports/`、`exports/` は Git 管理外です。
+本リポジトリの例にあるトーク名・ドメイン・リソースIDは架空のものです。

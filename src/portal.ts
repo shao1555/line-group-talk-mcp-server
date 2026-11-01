@@ -34,7 +34,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path === "/authorize") return handleMcpConsent(request, env);
   if (path.startsWith("/auth/")) return handlePortalAuth(request, env);
   if (request.method === "GET" && (path === "/" || path === "/portal" || /^\/knowledge\/[a-f0-9-]{36}$/.test(path))) {
-    return new Response(portalHtml(loginConfigured(env), safeReturnTo(path + new URL(request.url).search)), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(portalHtml(loginConfigured(env), safeReturnTo(path + new URL(request.url).search), { friend: env.LINE_FRIEND_URL, qr: env.LINE_FRIEND_QR_URL }), { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
   if (request.method === "GET" && path === "/portal.js") return new Response(portalJs, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
   if (request.method === "GET" && path === "/portal.css") return new Response(portalCss, { headers: { "Content-Type": "text/css; charset=utf-8" } });

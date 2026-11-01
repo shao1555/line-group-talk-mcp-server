@@ -1,3 +1,4 @@
+import { portalHtml } from "../src/portal-ui";
 import { syncDocumentProjections } from "../src/documents";
 import { searchKnowledge } from "../src/search";
 import { directEvidenceAvailable } from "../src/direct-chat";
@@ -504,4 +505,16 @@ describe("uploaded knowledge", () => {
     expect((await upload(session, [], 'binary', 'app.exe')).status).toBe(400);
     expect((await upload(session, [], '')).status).toBe(400);
   });
+});
+
+it('renders deployment links only when configured with official HTTPS origins', () => {
+  const plain = portalHtml(true);
+  expect(plain).not.toContain('bot を友だち追加</a>');
+  const links = { friend: 'https://lin.ee/test?x=1&y=%22', qr: 'https://qr-official.line.me/gs/test.png' };
+  const html = portalHtml(true, '/', links);
+  expect(html).toContain('href="https://lin.ee/test?x=1&amp;y=%22"');
+  expect(html).toContain('src="https://qr-official.line.me/gs/test.png"');
+  for (const friend of ['javascript:alert(1)', 'https://lin.ee.evil.example/x', 'https://user@lin.ee/x']) {
+    expect(portalHtml(true, '/', { ...links, friend })).not.toContain('bot を友だち追加</a>');
+  }
 });

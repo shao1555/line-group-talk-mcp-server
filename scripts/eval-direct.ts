@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { DIRECT_MODELS, DEFAULT_DIRECT_MODEL, directCost, directReservation, decodeDirectDecision, type DirectModelName } from '../src/direct-model';
@@ -35,9 +35,9 @@ if (!args.includes('--live')) {
     maxUsd, hint:'Add --live to invoke Workers AI. Production prompts, model settings and pricing are reused.' },null,2));
   process.exit(0);
 }
-const config = readFileSync('wrangler.jsonc','utf8');
+const config = readFileSync(option('--config', existsSync('wrangler.private.jsonc') ? 'wrangler.private.jsonc' : 'wrangler.jsonc'),'utf8');
 const account = config.match(/"account_id"\s*:\s*"([a-f0-9]{32})"/)?.[1];
-if (!account) throw Error('Missing project account_id');
+if (!account || /^0+$/.test(account)) throw Error('Missing project account_id');
 const profile = process.env.WRANGLER_CONFIG_PATH ?? join(homedir(),'Library/Preferences/.wrangler/config/default.toml');
 const token = process.env.CLOUDFLARE_API_TOKEN ?? readFileSync(profile,'utf8').match(/oauth_token\s*=\s*"([^"]+)"/)?.[1];
 if (!token) throw Error('Set CLOUDFLARE_API_TOKEN or log in with project Wrangler');

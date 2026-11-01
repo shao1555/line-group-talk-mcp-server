@@ -1,4 +1,13 @@
-export function portalHtml(configured: boolean, returnTo = "/"): string {
+function lineLink(value: string, hostname: string): string {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== hostname || url.username || url.password) return "";
+    return url.href.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  } catch { return ""; }
+}
+
+export function portalHtml(configured: boolean, returnTo = "/", links = { friend: "", qr: "" }): string {
+  const friend = lineLink(links.friend, "lin.ee"), qr = lineLink(links.qr, "qr-official.line.me");
   return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LINE Talk — ナレッジポータル</title><link rel="stylesheet" href="/portal.css"><script src="/portal.js" defer></script></head>
 <body><header><a class="brand" href="/">LINE Talk<span>KNOWLEDGE PORTAL</span></a><div id="account" hidden><span id="user-name"></span><button id="logout" class="quiet">ログアウト</button></div></header>
 <main><section id="welcome" class="welcome"><p class="eyebrow">会話の記憶を、次の活動へ。</p><h1>いつものトークを<br>あなたのナレッジに。</h1><p class="lead">あなたと bot が参加するトークを確認して、<br>AI セッションから会話の記憶を活用できます。</p>
@@ -17,7 +26,7 @@ ${configured ? `<a class="button login" href="/auth/line?returnTo=${encodeURICom
 <div id="import-confirmation" hidden><p id="import-summary"></p><p class="muted small">書き出しのトーク名と取り込み先が一致することを確認してください。履歴はこのトークの参加者から検索可能になります。画像・ファイルの実体は含まれません。表示名からユーザーIDへの対応付けや、Webhook で受信済みの発言との重複照合は行いません。</p><button class="button" id="import-start">このトークに取り込む</button></div><p id="import-progress" role="status" aria-live="polite"></p><p class="muted small">途中で閉じた場合は、同じファイルを選んで再開できます。再アップロード時は同一の書き出し発言を重複登録しません。検索への反映は費用上限に従って順次進みます。</p></section>
 </div><div data-page="connections" hidden><section class="panel"><p class="eyebrow">CONNECT YOUR AI</p><h2>MCP サーバーに接続</h2><p>MCP クライアントに次の URL を追加し、ブラウザーで LINE ログインと接続の許可を行ってください。</p><label for="endpoint">サーバー URL</label><input id="endpoint" readonly><p class="muted small">OAuth / DCR による自動接続に対応しています。トークンの手動コピーは不要です。</p></section>
 <section class="panel token-list"><div class="section-title"><h2>接続を許可したアプリ</h2><span class="muted small">不要になった接続は解除できます</span></div><div id="connections"></div></section></div></div></div>
-<section id="onboarding" class="panel onboarding"><div><p class="eyebrow">GET STARTED</p><h2>まだ bot を使っていない方へ</h2><ol><li>公式アカウントを友だち追加します。</li><li>記録したいグループに bot を招待します。</li><li>グループで一度発言してから、ログインして参加トークを確認します。</li></ol><a class="button" href="https://lin.ee/EXAMPLE" target="_blank" rel="noopener noreferrer">bot を友だち追加</a><p class="muted small">友だち追加だけではグループは記録されません。グループへの招待も必要です。</p></div><a href="https://lin.ee/EXAMPLE" target="_blank" rel="noopener noreferrer"><img src="https://qr-official.line.me/gs/EXAMPLE.png" width="180" height="180" alt="LINE 公式アカウントを友だち追加する QR コード" loading="lazy"></a></section>
+<section id="onboarding" class="panel onboarding"><div><p class="eyebrow">GET STARTED</p><h2>まだ bot を使っていない方へ</h2><ol><li>公式アカウントを友だち追加します。</li><li>記録したいグループに bot を招待します。</li><li>グループで一度発言してから、ログインして参加トークを確認します。</li></ol>${friend ? `<a class="button" href="${friend}" target="_blank" rel="noopener noreferrer">bot を友だち追加</a>` : "<p>公式アカウントの追加方法は管理者に確認してください。</p>"}<p class="muted small">友だち追加だけではグループは記録されません。グループへの招待も必要です。</p></div>${friend && qr ? `<a href="${friend}" target="_blank" rel="noopener noreferrer"><img src="${qr}" width="180" height="180" alt="LINE 公式アカウントを友だち追加する QR コード" loading="lazy"></a>` : ""}</section>
 </main><footer>LINE Talk · あなたの参加トークだけを、必要なセッションへ。</footer></body></html>`;
 }
 

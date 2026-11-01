@@ -3,7 +3,7 @@
 	"main": "src/index.ts",
 	"rules": [{ "type": "Data", "globs": ["**/*.png"], "fallthrough": true }],
 	"workers_dev": true,
-	"routes": [{ "pattern": "line-talk.example.com", "custom_domain": true }],
+	"routes": [], // Configure your custom domain in wrangler.private.jsonc.
 	"account_id": "00000000000000000000000000000000",
 	// Latest date supported by the workerd bundled with the pinned toolchain.
 	"compatibility_date": "2026-10-30",
@@ -14,6 +14,8 @@
 		"PORTAL_ORIGIN": "https://line-talk.example.com",
 		"LEGACY_PORTAL_ORIGIN": "https://legacy.example.com",
 		"LINE_LOGIN_CHANNEL_ID": "0000000000",
+		"LINE_FRIEND_URL": "",
+		"LINE_FRIEND_QR_URL": "",
 		"MAX_ATTACHMENT_BYTES": "104857600",
 		"AI_MONTHLY_BUDGET_USD": "5",
 		"AI_DAILY_IMAGES": "20",

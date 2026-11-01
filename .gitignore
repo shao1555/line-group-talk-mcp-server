@@ -20,3 +20,6 @@ exports/
 
 # OS files
 .DS_Store
+
+# Deployment settings (never publish identifiers or account links)
+wrangler.private.jsonc
