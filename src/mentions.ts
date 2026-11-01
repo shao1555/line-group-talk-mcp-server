@@ -1,3 +1,6 @@
+import { generateDirectAnswer, directEvidenceAvailable } from "./direct-chat";
+import { directUsage, DIRECT_LIMIT, DIRECT_WARNING, UserBudgetExceeded, isUsageQuestion, usageAnswer } from "./direct-usage";
+import { recordSentBotMessage } from "./bot-messages";
 import { BudgetExceeded, VISION_MODEL, reserveAI, settleVisionUsage } from "./ai";
 import { collectAnswerEvidence, formatAnswerEvidence, japaneseTime, type AnswerEvidence } from "./answer-context";
 import { parseHistoryPlan, type HistoryPlan } from "./history-plan";
@@ -127,7 +130,7 @@ async function evidenceStillAvailable(ids: string[], conversationId: string, env
   return result?.n === unique.length;
 }
 
-export async function answerMention(messageId: string, question: string, conversationId: string, replyToken: string, env: Env, quoteToken?: string): Promise<void> {
+export async function answerMention(messageId: string, question: string, conversationId: string, replyToken: string, env: Env, quoteToken?: string, directUserId?: string): Promise<void> {
   const deadline = Date.now() + 24_000;
   const claim = await env.DB.prepare(`INSERT INTO bot_replies(message_id, status, created_at)
     SELECT message_id, 'processing', ? FROM messages WHERE message_id = ? AND unsent_at IS NULL
@@ -139,8 +142,14 @@ export async function answerMention(messageId: string, question: string, convers
   let evidenceIds: string[] = previous?.evidence_ids ? JSON.parse(previous.evidence_ids) : [];
   let replyStarted = false;
   try {
+    if (directUserId && !isUsageQuestion(question) && await directUsage(directUserId, env) >= DIRECT_LIMIT) throw new UserBudgetExceeded();
     if (!answer) {
-      if (!question) answer = "調べたいことをメンションと一緒に送ってください。";
+      if (directUserId) {
+        if (isUsageQuestion(question)) answer = await usageAnswer(directUserId, env);
+        else {
+          ({ answer, evidenceIds } = await generateDirectAnswer(question, directUserId, messageId, env, deadline));
+        }
+      } else if (!question) answer = "調べたいことをメンションと一緒に送ってください。";
       else {
         let hits: AnswerEvidence[] = [];
         let questionSentAt = Date.now();
@@ -164,15 +173,24 @@ export async function answerMention(messageId: string, question: string, convers
     const source = await env.DB.prepare("SELECT unsent_at FROM messages WHERE message_id = ? AND conversation_id = ?")
       .bind(messageId, conversationId).first<{ unsent_at: number | null }>();
     if (!source || source.unsent_at !== null) return;
-    if (!await evidenceStillAvailable(evidenceIds, conversationId, env)) {
-      answer = "参照した発言が取り消されたため、回答を控えます。";
+    if (!(directUserId ? await directEvidenceAvailable(evidenceIds, directUserId, env) : await evidenceStillAvailable(evidenceIds, conversationId, env))) {
+      answer = directUserId ? "参照した発言が取り消されたか、参照権限を確認できなくなったため、回答を控えます。" : "参照した発言が取り消されたため、回答を控えます。";
       await env.DB.prepare("UPDATE bot_replies SET text = NULL, evidence_ids = NULL WHERE message_id = ?").bind(messageId).run();
+    }
+    if (directUserId && !isUsageQuestion(question)) {
+      const cost = await directUsage(directUserId, env);
+      if (cost >= DIRECT_LIMIT) throw new UserBudgetExceeded();
+      const warning = "直近24時間の利用量の80%に達しました";
+      if (cost >= DIRECT_WARNING && !answer.includes(warning)) {
+        answer = answer.slice(0, 3900) + `\n\n⚠️ ${warning}（上限 $0.50）。`;
+        await env.DB.prepare("UPDATE bot_replies SET text = ? WHERE message_id = ? AND text IS NOT NULL").bind(answer, messageId).run();
+      }
     }
     replyStarted = true;
     const response = await fetch("https://api.line.me/v2/bot/message/reply", {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` },
       body: JSON.stringify({ replyToken, messages: [{ type: "text", text: answer,
-        ...(typeof quoteToken === "string" && quoteToken.length <= 2000 ? { quoteToken } : {}) }] }), signal: AbortSignal.timeout(5000),
+        ...(!directUserId && typeof quoteToken === "string" && quoteToken.length <= 2000 ? { quoteToken } : {}) }] }), signal: AbortSignal.timeout(5000),
     });
     if (!response.ok) { await response.body?.cancel(); throw new Error("LINE reply failed"); }
     const receipt = await response.json() as { sentMessages?: { id?: unknown }[] };
@@ -182,7 +200,13 @@ export async function answerMention(messageId: string, question: string, convers
         .bind(typeof sentId === "string" ? sentId : null, messageId),
       env.DB.prepare("UPDATE messages SET replied_at = ? WHERE message_id = ?").bind(Date.now(), messageId),
     ]);
+    try { await recordSentBotMessage(messageId, env); }
+    catch { console.error(JSON.stringify({ event: "bot_message_record_failed", messageId })); }
   } catch (error) {
+    if (error instanceof UserBudgetExceeded) {
+      await env.DB.prepare("UPDATE bot_replies SET status = 'blocked', text = NULL, evidence_ids = NULL WHERE message_id = ?").bind(messageId).run();
+      return;
+    }
     if (!replyStarted) {
       console.error(JSON.stringify({ event: "mention_generation_failed", messageId,
         errorType: error instanceof InvalidModelResponse ? "InvalidModelResponse" : error instanceof Error ? error.name : "UnknownError" }));
@@ -191,7 +215,7 @@ export async function answerMention(messageId: string, question: string, convers
         AND NOT EXISTS (SELECT 1 FROM unsent_messages WHERE message_id = ?)`)
         .bind(error instanceof BudgetExceeded ? "AI 処理の利用上限に達しています。記録は引き続き保存しています。"
           : "回答を一時的に生成できません。少し待ってから、もう一度メンションしてください。", messageId, messageId).run();
-      await answerMention(messageId, question, conversationId, replyToken, env, quoteToken);
+      await answerMention(messageId, question, conversationId, replyToken, env, quoteToken, directUserId);
       return;
     }
     console.error(JSON.stringify({ event: "mention_answer_failed", messageId }));

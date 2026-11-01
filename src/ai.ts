@@ -1,4 +1,6 @@
+import { DAY_MS, DIRECT_LIMIT, UserBudgetExceeded, directUsage } from "./direct-usage";
 export const VISION_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
+export const DIRECT_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8";
 export const AUDIO_MODEL = "@cf/openai/whisper-large-v3-turbo";
 export const EMBEDDING_MODEL = "@cf/baai/bge-m3";
 export const PROCESSOR_VERSION = "2026-11-01-v1";
@@ -30,12 +32,17 @@ export async function reserveAI(kind: "image" | "audio" | "embedding" | "answer"
   const id = crypto.randomUUID();
   // A single conditional INSERT serializes both checks in D1, across all workers.
   const result = await env.DB.prepare(`INSERT INTO ai_usage
-    (id, month, day, kind, model, units, reserved_microusd, charged_microusd, created_at)
-    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+    (id, month, day, kind, model, units, reserved_microusd, charged_microusd, created_at, owner_user_id)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     WHERE COALESCE((SELECT SUM(charged_microusd) FROM ai_usage WHERE month = ?), 0) + ? <= ?
-    AND COALESCE((SELECT SUM(units) FROM ai_usage WHERE day = ? AND kind = ?), 0) + ? <= ?`)
-    .bind(id, month, day, kind, model, units, cost, cost, now.getTime(), month, cost, budget, day, kind, units, limits[kind]).run();
-  if (!result.meta.changes) throw new BudgetExceeded();
+    AND COALESCE((SELECT SUM(units) FROM ai_usage WHERE day = ? AND kind = ?), 0) + ? <= ?
+    AND (? IS NULL OR COALESCE((SELECT SUM(charged_microusd) FROM ai_usage WHERE owner_user_id = ? AND created_at > ?), 0) + ? <= ?)` )
+    .bind(id, month, day, kind, model, units, cost, cost, now.getTime(), env.AI_BILLING_USER_ID ?? null, month, cost, budget, day, kind, units, limits[kind],
+      env.AI_BILLING_USER_ID ?? null, env.AI_BILLING_USER_ID ?? null, now.getTime() - DAY_MS, cost, DIRECT_LIMIT).run();
+  if (!result.meta.changes) {
+    if (env.AI_BILLING_USER_ID && await directUsage(env.AI_BILLING_USER_ID, env) + cost > DIRECT_LIMIT) throw new UserBudgetExceeded();
+    throw new BudgetExceeded();
+  }
   return id;
 }
 

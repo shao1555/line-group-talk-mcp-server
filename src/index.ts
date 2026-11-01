@@ -1,3 +1,4 @@
+import { recordSentBotMessage, repairSentBotMessages } from "./bot-messages";
 import { cancelAttachment, consumeAttachments, recordAttachment, repairAttachmentJobs } from "./attachments";
 import type { MediaMessage, AttachmentJob } from "./attachments";
 import { consumeKnowledge, markForIndex, repairKnowledgeJobs } from "./knowledge";
@@ -64,7 +65,8 @@ async function processEvent(event: LineEvent, env: Env, ctx?: ExecutionContext):
     .bind(message.id).first<{ text: string | null; unsent_at: number | null; replied_at: number | null }>();
   if (stored?.text && stored.unsent_at === null && stored.replied_at === null && event.replyToken && event.mode !== "standby") {
     const mentions = message.mention?.mentionees ?? [];
-    let question = mentionQuestion(stored.text, mentions);
+    const directUserId = source.type === "user" && source.userId && /^U[a-f0-9]{32}$/.test(source.userId) ? source.userId : undefined;
+    let question = directUserId && stored.text !== "ping" ? stored.text.slice(0, 2000) : mentionQuestion(stored.text, mentions);
     if (typeof message.quotedMessageId === "string") {
       const parent = await env.DB.prepare(`SELECT b.message_id FROM bot_replies b JOIN messages m USING(message_id)
         WHERE b.line_message_id = ? AND b.status = 'sent' AND b.text IS NOT NULL
@@ -77,7 +79,7 @@ async function processEvent(event: LineEvent, env: Env, ctx?: ExecutionContext):
       }
     }
     if (question !== null) {
-      const response = answerMention(message.id, question, conversationId, event.replyToken, env, message.quoteToken);
+      const response = answerMention(message.id, question, conversationId, event.replyToken, env, message.quoteToken, directUserId);
       if (ctx) ctx.waitUntil(response);
       else await response;
       return;
@@ -92,10 +94,17 @@ async function processEvent(event: LineEvent, env: Env, ctx?: ExecutionContext):
     body: JSON.stringify({ replyToken: event.replyToken, messages: [{ type: "text", text: "pong" }] }),
     signal: AbortSignal.timeout(5000),
   });
-  await response.body?.cancel();
-  if (!response.ok) throw new Error(`LINE reply failed: ${response.status}`);
-  await env.DB.prepare("UPDATE messages SET replied_at = ? WHERE message_id = ?")
-    .bind(Date.now(), message.id).run();
+  if (!response.ok) { await response.body?.cancel(); throw new Error(`LINE reply failed: ${response.status}`); }
+  const receipt = await response.json() as { sentMessages?: { id?: unknown }[] };
+  const sentId = receipt.sentMessages?.[0]?.id;
+  await env.DB.batch([
+    env.DB.prepare("UPDATE messages SET replied_at = ? WHERE message_id = ?").bind(Date.now(), message.id),
+    env.DB.prepare(`INSERT INTO bot_replies(message_id, status, text, evidence_ids, created_at, line_message_id)
+      SELECT message_id, 'sent', 'pong', '[]', ?, ? FROM messages WHERE message_id = ? AND unsent_at IS NULL
+      ON CONFLICT(message_id) DO NOTHING`).bind(Date.now(), typeof sentId === "string" ? sentId : null, message.id),
+  ]);
+  try { await recordSentBotMessage(message.id, env); }
+  catch { console.error(JSON.stringify({ event: "bot_message_record_failed", messageId: message.id })); }
 }
 
 export default {
@@ -104,6 +113,7 @@ export default {
     else await consumeAttachments(batch, env);
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await repairSentBotMessages(env);
     await repairAttachmentJobs(env);
     await repairKnowledgeJobs(env);
   },

@@ -2,9 +2,9 @@ import { embed, sha256 } from "./ai";
 import { readLimitedBody } from "./http";
 import { verifyConversationAccess, type AccessibleConversation } from "./conversations";
 
-export type SearchHit = { messageId: string; text: string; sentAt: number; fileName: string | null; score: number };
+export type SearchHit = { messageId: string; text: string; sentAt: number; fileName: string | null; score: number; sender_role?: "user" | "bot"; sender_name?: string | null; user_id?: string | null; reply_to_message_id?: string | null };
 export type SearchPrincipal = { conversationIds: string[]; conversations?: AccessibleConversation[] };
-export type SearchRange = { from?: number; before?: number; fallbackToAllTime?: boolean; timeoutMs?: number };
+export type SearchRange = { from?: number; before?: number; fallbackToAllTime?: boolean; timeoutMs?: number; includeBot?: boolean };
 
 export async function authenticateSearch(request: Request, env: Env): Promise<SearchPrincipal | null> {
   const token = request.headers.get("Authorization")?.match(/^Bearer ([\w-]{32,256})$/)?.[1];
@@ -33,34 +33,34 @@ export async function searchKnowledge(query: string, conversationId: string, env
   });
   const scores = new Map(matches.matches.map((match) => [match.id, match.score]));
   if (!scores.size) return range.fallbackToAllTime && Object.keys(sentAt).length
-    ? queryAllTime(vector, conversationId, env, excludeId, limit) : [];
+    ? queryAllTime(vector, conversationId, env, excludeId, limit, range.includeBot) : [];
   const ids = [...scores.keys()];
-  const { results } = await env.DB.prepare(`SELECT c.id, c.text, m.message_id, m.sent_at, a.file_name
+  const { results } = await env.DB.prepare(`SELECT c.id, c.text, m.message_id, m.sent_at, m.sender_role, m.sender_name, m.user_id, m.reply_to_message_id, a.file_name
     FROM knowledge_chunks c JOIN messages m USING(message_id) JOIN knowledge_jobs j USING(message_id)
     LEFT JOIN attachments a USING(message_id)
-    WHERE c.id IN (${ids.map(() => "?").join(",")}) AND m.conversation_id = ? AND m.unsent_at IS NULL
+    WHERE c.id IN (${ids.map(() => "?").join(",")}) AND m.conversation_id = ? AND m.unsent_at IS NULL AND (m.sender_role = 'user' OR ?)
     AND c.text IS NOT NULL AND j.status = 'ready' AND m.message_id != ?
     AND m.sent_at >= ? AND m.sent_at < ?`)
-    .bind(...ids, conversationId, excludeId ?? "", range.from ?? 0, range.before ?? Number.MAX_SAFE_INTEGER)
-    .all<{ id: string; text: string; message_id: string; sent_at: number; file_name: string | null }>();
-  if (!results.length && range.fallbackToAllTime && Object.keys(sentAt).length) return queryAllTime(vector, conversationId, env, excludeId, limit);
+    .bind(...ids, conversationId, range.includeBot ? 1 : 0, excludeId ?? "", range.from ?? 0, range.before ?? Number.MAX_SAFE_INTEGER)
+    .all<{ id: string; text: string; message_id: string; sent_at: number; file_name: string | null; sender_role: "user" | "bot"; sender_name: string | null; user_id: string | null; reply_to_message_id: string | null }>();
+  if (!results.length && range.fallbackToAllTime && Object.keys(sentAt).length) return queryAllTime(vector, conversationId, env, excludeId, limit, range.includeBot);
   return results.sort((a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)).slice(0, limit)
-    .map((row) => ({ messageId: row.message_id, text: row.text, sentAt: row.sent_at, fileName: row.file_name, score: scores.get(row.id) ?? 0 }));
+    .map((row) => ({ messageId: row.message_id, text: row.text, sentAt: row.sent_at, fileName: row.file_name, score: scores.get(row.id) ?? 0, sender_role: row.sender_role, sender_name: row.sender_name, user_id: row.user_id, reply_to_message_id: row.reply_to_message_id }));
 }
 
-async function queryAllTime(vector: number[], conversationId: string, env: Env, excludeId: string | undefined, limit: number): Promise<SearchHit[]> {
+async function queryAllTime(vector: number[], conversationId: string, env: Env, excludeId: string | undefined, limit: number, includeBot = false): Promise<SearchHit[]> {
   // Reuse the query embedding when broadening an empty date-filtered search.
   const matches = await env.KNOWLEDGE.query(vector, { namespace: conversationId, topK: Math.min(limit * 3, 30), returnMetadata: "none" });
   if (!matches.matches.length) return [];
   const scores = new Map(matches.matches.map((match) => [match.id, match.score]));
   const ids = [...scores.keys()];
-  const { results } = await env.DB.prepare(`SELECT c.id, c.text, m.message_id, m.sent_at, a.file_name
+  const { results } = await env.DB.prepare(`SELECT c.id, c.text, m.message_id, m.sent_at, m.sender_role, m.sender_name, m.user_id, m.reply_to_message_id, a.file_name
     FROM knowledge_chunks c JOIN messages m USING(message_id) JOIN knowledge_jobs j USING(message_id)
     LEFT JOIN attachments a USING(message_id) WHERE c.id IN (${ids.map(() => "?").join(",")})
-    AND m.conversation_id = ? AND m.unsent_at IS NULL AND c.text IS NOT NULL AND j.status = 'ready' AND m.message_id != ?`)
-    .bind(...ids, conversationId, excludeId ?? "").all<{ id: string; text: string; message_id: string; sent_at: number; file_name: string | null }>();
+    AND m.conversation_id = ? AND m.unsent_at IS NULL AND (m.sender_role = 'user' OR ?) AND c.text IS NOT NULL AND j.status = 'ready' AND m.message_id != ?`)
+    .bind(...ids, conversationId, includeBot ? 1 : 0, excludeId ?? "").all<{ id: string; text: string; message_id: string; sent_at: number; file_name: string | null; sender_role: "user" | "bot"; sender_name: string | null; user_id: string | null; reply_to_message_id: string | null }>();
   return results.sort((a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)).slice(0, limit)
-    .map((row) => ({ messageId: row.message_id, text: row.text, sentAt: row.sent_at, fileName: row.file_name, score: scores.get(row.id) ?? 0 }));
+    .map((row) => ({ messageId: row.message_id, text: row.text, sentAt: row.sent_at, fileName: row.file_name, score: scores.get(row.id) ?? 0, sender_role: row.sender_role, sender_name: row.sender_name, user_id: row.user_id, reply_to_message_id: row.reply_to_message_id }));
 }
 
 export async function handleSearch(request: Request, env: Env): Promise<Response> {

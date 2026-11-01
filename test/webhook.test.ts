@@ -51,7 +51,8 @@ describe("LINE webhook with D1", () => {
     expect((await row())?.replied_at).toEqual(expect.any(Number));
     expect((await post([message("ping")])).status).toBe(200);
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(await env.DB.prepare("SELECT count(*) AS n FROM messages").first("n")).toBe(1);
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM messages WHERE sender_role = 'user'").first("n")).toBe(1);
+    expect(await env.DB.prepare("SELECT text, sender_role, reply_to_message_id FROM messages WHERE sender_role = 'bot'").first()).toMatchObject({ text: "pong", sender_role: "bot", reply_to_message_id: "message-1" });
   });
 
   it("keeps text on reply failure and retries on redelivery", async () => {

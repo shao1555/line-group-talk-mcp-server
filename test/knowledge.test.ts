@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { PDFDocument } from "pdf-lib";
+import { repairKnowledgeJobs } from "../src/knowledge";
 import worker from "../src/index";
 import { reserveAI, EMBEDDING_MODEL, VISION_MODEL, AUDIO_MODEL } from "../src/ai";
 import { bindings, message, post, unsend } from "./helpers";
@@ -58,6 +59,13 @@ describe("knowledge extraction and indexing", () => {
     await consume();
     expect(await job()).toMatchObject({ status: "ready", extracted_text: "書き出し履歴・表示名: 書き出しの名前\n去年は京都に行きました" });
     expect(bindings.KNOWLEDGE.upsert).toHaveBeenCalledWith([expect.objectContaining({ namespace: "group-1" })]);
+  });
+
+  it("labels the bot's own answer in indexed text", async () => {
+    await post([message("botによる買い物の提案")]);
+    await env.DB.prepare("UPDATE messages SET sender_role = 'bot', sender_name = 'bot', user_id = NULL WHERE message_id = 'message-1'").run();
+    await consume();
+    expect(await job()).toMatchObject({ status: "ready", extracted_text: "bot 自身の発言（提案・回答。人間の決定とは限りません）\nbotによる買い物の提案" });
   });
 
   it("extracts OCR and description, then indexes, without summarizing the conversation", async () => {
@@ -166,4 +174,47 @@ describe("knowledge extraction and indexing", () => {
     expect(bindings.KNOWLEDGE.deleteByIds).toHaveBeenCalled();
     expect(await job()).toMatchObject({ status: "deleted", extracted_text: null });
   });
+  it("does not call the model twice when a duplicate arrives during processing", async () => {
+    await post([message("集合は10時です")]);
+    vi.mocked(bindings.AI.run).mockImplementationOnce(async () => {
+      await consume(); // another consumer/retry sees the same job while its lease is held
+      return { data: [vector] };
+    });
+    await consume();
+    expect(bindings.AI.run).toHaveBeenCalledTimes(1);
+    expect(await job()).toMatchObject({ status: "ready", lease_token: null, lease_until: 0 });
+  });
+  it("recovers an expired processing lease", async () => {
+    await post([message("集合は10時です")]);
+    await env.DB.prepare("UPDATE knowledge_jobs SET lease_token = 'abandoned', lease_until = ? WHERE message_id = 'message-1'").bind(Date.now() - 1).run();
+    await consume();
+    expect(await job()).toMatchObject({ status: "ready", lease_token: null, lease_until: 0 });
+  });
+  it("dispatches 100 pending jobs in batches without republishing active or newly queued jobs", async () => {
+    const now = Date.now();
+    await env.DB.batch(Array.from({ length: 105 }, (_, i) => env.DB.prepare(`INSERT INTO messages(message_id, source_type, conversation_id, message_type, text, sent_at, received_at)
+      VALUES (?, 'group', 'group-1', 'text', '履歴', ?, ?)`).bind(`bulk-${i}`, now, now)));
+    await env.DB.prepare("INSERT INTO knowledge_jobs(message_id) SELECT message_id FROM messages").run();
+    await env.DB.prepare("UPDATE knowledge_jobs SET lease_until = ? WHERE message_id = 'bulk-0'").bind(now + 60_000).run();
+    await env.DB.prepare("UPDATE knowledge_jobs SET queued_at = ? WHERE message_id = 'bulk-1'").bind(now).run();
+    await repairKnowledgeJobs(bindings);
+    expect(bindings.KNOWLEDGE_QUEUE.sendBatch).toHaveBeenCalledTimes(1);
+    const requests = vi.mocked(bindings.KNOWLEDGE_QUEUE.sendBatch).mock.calls.flatMap(([items]) => Array.from(items));
+    expect(requests).toHaveLength(100);
+    expect(requests.map((r) => (r.body as { messageId: string }).messageId)).not.toContain('bulk-0');
+    expect(requests.map((r) => (r.body as { messageId: string }).messageId)).not.toContain('bulk-1');
+    await repairKnowledgeJobs(bindings);
+    expect(vi.mocked(bindings.KNOWLEDGE_QUEUE.sendBatch).mock.calls).toHaveLength(2);
+    expect(Array.from(vi.mocked(bindings.KNOWLEDGE_QUEUE.sendBatch).mock.calls[1][0])).toHaveLength(3);
+  });
+  it("keeps jobs eligible for the next minute when batch publication fails", async () => {
+    await post([message("履歴")]);
+    await env.DB.prepare("UPDATE knowledge_jobs SET queued_at = NULL").run();
+    vi.mocked(bindings.KNOWLEDGE_QUEUE.sendBatch).mockRejectedValueOnce(new Error("Queue unavailable"));
+    await repairKnowledgeJobs(bindings);
+    expect((await job())?.queued_at).toBeNull();
+    await repairKnowledgeJobs(bindings);
+    expect((await job())?.queued_at).toEqual(expect.any(Number));
+  });
+
 });

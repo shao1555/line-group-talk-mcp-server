@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { recordSentBotMessage, repairSentBotMessages } from "../src/bot-messages";
 import worker from "../src/index";
 import { sha256, EMBEDDING_MODEL, VISION_MODEL, reserveAI } from "../src/ai";
 import { searchKnowledge } from "../src/search";
@@ -399,5 +400,81 @@ describe("model-selected history search", () => {
     expect(hits.map((hit) => hit.messageId)).toContain("memory");
     expect(bindings.AI.run).toHaveBeenCalledTimes(1);
     expect(bindings.KNOWLEDGE.query).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+async function mcpTool(name: string, args: Record<string, unknown>) {
+  const response = await worker.fetch(new Request(`${bindings.PORTAL_ORIGIN}/mcp`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, Host: new URL(bindings.PORTAL_ORIGIN).hostname, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name, arguments: args } }),
+  }), bindings, createExecutionContext());
+  expect(response.status).toBe(200);
+  const body = await response.text();
+  const json = JSON.parse(response.headers.get("Content-Type")?.includes("text/event-stream") ? body.split("\n").find((l) => l.startsWith("data: "))!.slice(6) : body);
+  return json.result;
+}
+async function savedBotAnswer(questionId: string, replyId: string, text: string, status = "sent", evidence: string[] = []) {
+  await env.DB.prepare("UPDATE messages SET replied_at = sent_at + 1000 WHERE message_id = ?").bind(questionId).run();
+  await env.DB.prepare("INSERT INTO bot_replies(message_id, status, text, evidence_ids, created_at, line_message_id) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(questionId, status, text, JSON.stringify(evidence), 1700000001000, replyId).run();
+  await recordSentBotMessage(questionId, bindings);
+}
+
+describe("MCP bot speech", () => {
+  it("returns complete sent bot answers in chronological history with role and reply attribution", async () => {
+    await seed("q", "group-1", "買い物は何が必要？");
+    const answer = "買い物の提案: 豆腐、ねぎ。" + "補足".repeat(1100);
+    await savedBotAnswer("q", "sent-bot", answer);
+    await recordSentBotMessage("q", bindings); // duplicate receipt is harmless
+    await seed("foreign-q", "group-2", "別トーク");
+    await savedBotAnswer("foreign-q", "foreign-bot", "別トークの提案");
+    const response = await mcpTool("get_recent_messages", { conversationId: "group-1", limit: 10 });
+    const messages = JSON.parse(response.content[0].text);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatchObject({ message_id: "q", sender_role: "user" });
+    expect(messages[1]).toMatchObject({ message_id: "sent-bot", sender_role: "bot", sender_name: "bot", user_id: null, text: answer, reply_to_message_id: "q" });
+    const denied = await mcpTool("get_recent_messages", { conversationId: "group-2" });
+    expect(denied.isError).toBe(true);
+  });
+  it("searches bot answers through MCP while keeping them out of the bot's own factual evidence", async () => {
+    await seed("q", "group-1", "買い物は？");
+    await savedBotAnswer("q", "sent-bot", "豆腐、ねぎを提案します。");
+    await env.DB.prepare("UPDATE knowledge_jobs SET status = 'ready' WHERE message_id = 'sent-bot'").run();
+    await env.DB.prepare("INSERT INTO knowledge_chunks(id, message_id, ordinal, text) VALUES ('chunk-sent-bot', 'sent-bot', 0, '豆腐、ねぎを提案します。')").run();
+    result("sent-bot");
+    const response = await mcpTool("search_knowledge", { query: "買い物の提案", conversationId: "group-1" });
+    expect(JSON.parse(response.content[0].text)).toEqual([expect.objectContaining({ messageId: "sent-bot", sender_role: "bot", reply_to_message_id: "q" })]);
+    expect(await searchKnowledge("買い物", "group-1", bindings)).toEqual([]);
+    expect(await searchKnowledge("買い物", "group-1", bindings, undefined, 5, { includeBot: true, from: 1800000000000, fallbackToAllTime: true })).toEqual([expect.objectContaining({ sender_role: "bot" })]);
+    await post([{ ...message("今の質問"), timestamp: 1700000005000 }]);
+    const context = await collectAnswerEvidence("買い物", "group-1", "message-1", bindings);
+    expect(context.hits.some((h) => h.messageId === "sent-bot")).toBe(false);
+  });
+  it.each(["question", "evidence", "bot"])("hides bot answers and clears cached chunks after %s cancellation", async (kind) => {
+    await seed("evidence", "group-1", "元の事実");
+    await seed("q", "group-1", "質問");
+    await savedBotAnswer("q", "sent-bot", "botの提案", "sent", ["evidence"]);
+    await env.DB.prepare("UPDATE knowledge_jobs SET status = 'ready', extracted_text = 'botの提案' WHERE message_id = 'sent-bot'").run();
+    await env.DB.prepare("INSERT INTO knowledge_chunks(id, message_id, ordinal, text) VALUES ('chunk-sent-bot', 'sent-bot', 0, 'botの提案')").run();
+    const id = kind === "question" ? "q" : kind === "bot" ? "sent-bot" : "evidence";
+    await post([{ ...unsend(), unsend: { messageId: id } }]);
+    result("sent-bot");
+    expect(await searchKnowledge("提案", "group-1", bindings, undefined, 5, { includeBot: true })).toEqual([]);
+    const recent = await mcpTool("get_recent_messages", { conversationId: "group-1" });
+    expect(JSON.parse(recent.content[0].text).some((m: { sender_role: string }) => m.sender_role === "bot")).toBe(false);
+    expect(await env.DB.prepare("SELECT text FROM knowledge_chunks WHERE id = 'chunk-sent-bot'").first("text")).toBeNull();
+    await recordSentBotMessage("q", bindings);
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM messages WHERE sender_role = 'bot' AND unsent_at IS NULL").first("n")).toBe(0);
+  });
+  it("publishes only delivered answers and repairs missed persistence without sending LINE messages", async () => {
+    await seed("q", "group-1", "質問");
+    await savedBotAnswer("q", "sent-bot", "未送信", "ready");
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM messages WHERE sender_role = 'bot'").first("n")).toBe(0);
+    await env.DB.prepare("UPDATE bot_replies SET status = 'sent' WHERE message_id = 'q'").run();
+    const network = vi.spyOn(globalThis, "fetch");
+    await repairSentBotMessages(bindings);
+    expect(network).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM messages WHERE sender_role = 'bot'").first("n")).toBe(1);
   });
 });

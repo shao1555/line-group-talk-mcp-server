@@ -20,7 +20,7 @@
 - 最大5 MiBのパート単位で読み込み、必要に応じて R2 Multipart Upload を使う。失敗した未完了アップロードは abort する。
 - Queue は `max_concurrency: 1`、バッチ内も逐次処理とし、同じキーの保存と削除を直列化する。
 - 一時的なエラーには指数的な待ち時間を設け、初回を含め最大6回試行する。取得不能・サイズ超過は `failed`、試行上限超過は失敗状態を記録して DLQ に送る。
-- D1 を durable outbox とし、Webhook 応答前に処理待ちを記録する。Queue への投入失敗と滞留した `pending` / `delete_pending` は5分ごとの Cron で最大100件ずつ再投入する。
+- D1 を durable outbox とし、Webhook 応答前に処理待ちを記録する。Queue への投入失敗と滞留した `pending` / `delete_pending` は毎分の Cron で最大100件ずつ再投入する。
 - 送信取消の記録、本文削除、添付の `delete_pending` 化は同一 D1 トランザクションで行う。ファイル名等も消去し、Consumer が R2 の削除を確認してから `deleted` にする。
 - 保存完了後に取消状態を再確認する。保存直後の障害では R2 の head から回復し、LINE 側での取得期限切れによる再取得失敗を避ける。
 

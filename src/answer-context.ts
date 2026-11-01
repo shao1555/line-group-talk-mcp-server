@@ -49,7 +49,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
     FROM messages q JOIN messages p ON p.message_id = q.quoted_message_id
     LEFT JOIN knowledge_jobs j ON j.message_id = p.message_id
     WHERE q.message_id = ? AND q.conversation_id = ? AND p.conversation_id = ?
-    AND q.unsent_at IS NULL AND p.unsent_at IS NULL AND p.sent_at <= ? AND p.message_id != q.message_id`)
+    AND q.unsent_at IS NULL AND p.unsent_at IS NULL AND p.sender_role = 'user' AND p.sent_at <= ? AND p.message_id != q.message_id`)
     .bind(questionId, conversationId, conversationId, anchor.sent_at).first<ConversationRow>();
   const quote = quoted?.text ? fit([fromConversation(quoted, "quoted")], 1000) : [];
   const quoteIds = new Set(quote.map((hit) => hit.messageId));
@@ -57,7 +57,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
   // Recent raw utterances must not depend on asynchronous embedding/index visibility.
   // Exclude bot-directed questions from evidence; they are requests, not known facts.
   const recent = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
-    FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_type = 'text'
+    FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.sender_role = 'user' AND m.message_type = 'text'
     AND m.text IS NOT NULL AND m.message_id != ? AND m.sent_at <= ?
     AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)
     ORDER BY m.sent_at DESC, m.received_at DESC, m.message_id DESC LIMIT 20`)
@@ -73,7 +73,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
   if (plan?.keyword) {
     const keyword = `%${plan.keyword.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
     const lexical = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
-      FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_id != ?
+      FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.sender_role = 'user' AND m.message_id != ?
       AND m.sent_at <= ? AND m.sent_at >= ? AND m.sent_at < ? AND m.text LIKE ? ESCAPE '\\'
       AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)
       ORDER BY m.sent_at DESC LIMIT 5`)
@@ -82,7 +82,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
   }
   const ids = [...new Set(semantic.map((hit) => hit.messageId))];
   const allowed = ids.length ? await env.DB.prepare(`SELECT m.message_id, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id FROM messages m
-    WHERE m.message_id IN (${ids.map(() => "?").join(",")}) AND m.conversation_id = ? AND m.unsent_at IS NULL
+    WHERE m.message_id IN (${ids.map(() => "?").join(",")}) AND m.conversation_id = ? AND m.unsent_at IS NULL AND m.sender_role = 'user'
     AND m.sent_at <= ? AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)`)
     .bind(...ids, conversationId, anchor.sent_at).all<{ message_id: string; user_id: string | null }>() : { results: [] };
   const authors = new Map(allowed.results.map((row) => [row.message_id, row.user_id]));
@@ -97,7 +97,7 @@ export async function collectAnswerEvidence(question: string, conversationId: st
     if (seenAnchors.has(hit.messageId)) continue;
     seenAnchors.add(hit.messageId);
     const window = await env.DB.prepare(`SELECT m.message_id, substr(m.text, 1, 1200) AS text, m.sent_at, COALESCE(m.user_id, '書き出し表示名: ' || m.sender_name) AS user_id
-      FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.message_type = 'text'
+      FROM messages m WHERE m.conversation_id = ? AND m.unsent_at IS NULL AND m.sender_role = 'user' AND m.message_type = 'text'
       AND m.text IS NOT NULL AND m.message_id != ? AND m.sent_at BETWEEN ? AND ? AND m.sent_at <= ?
       AND NOT EXISTS (SELECT 1 FROM bot_replies b WHERE b.message_id = m.message_id)
       ORDER BY abs(m.sent_at - ?), m.sent_at LIMIT 6`)
