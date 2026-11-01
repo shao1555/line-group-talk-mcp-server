@@ -8,13 +8,15 @@
     "db:local": "wrangler d1 migrations apply DB --local",
     "db:remote": "wrangler d1 migrations apply DB --remote",
     "types": "wrangler types",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json && tsc --noEmit -p eval/tsconfig.json",
     "test": "vitest run",
-    "check": "npm run typecheck && npm test && wrangler deploy --dry-run"
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run",
+    "eval:direct": "node scripts/eval-direct.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.4.11",
     "@types/node": "26.6.6",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2",
     "vitest": "4.1.12"
   },

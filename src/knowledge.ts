@@ -5,7 +5,7 @@ export type KnowledgeJob = { messageId: string };
 type Job = {
   message_id: string; status: string; extracted_text: string | null; cache_key: string | null;
   extraction_attempts: number; indexing_attempts: number; next_attempt_at: number;
-  sender_role: string; sender_name: string | null; text: string | null; message_type: string; conversation_id: string; source_type: string; sent_at: number; unsent_at: number | null;
+  knowledge_document_id: string | null; document_title: string | null; sender_role: string; sender_name: string | null; text: string | null; message_type: string; conversation_id: string; source_type: string; sent_at: number; unsent_at: number | null;
 };
 
 export async function enqueueKnowledge(messageId: string, env: Env): Promise<void> {
@@ -16,9 +16,13 @@ export async function enqueueKnowledge(messageId: string, env: Env): Promise<voi
 }
 
 export async function markForIndex(messageId: string, env: Env): Promise<void> {
-  await env.DB.prepare(`INSERT INTO knowledge_jobs(message_id)
-    SELECT message_id FROM messages WHERE message_id = ? AND unsent_at IS NULL AND source_type != 'user'
-    ON CONFLICT(message_id) DO NOTHING`).bind(messageId).run();
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO knowledge_jobs(message_id)
+      SELECT message_id FROM messages WHERE message_id = ? AND unsent_at IS NULL AND source_type != 'user'
+      ON CONFLICT(message_id) DO NOTHING`).bind(messageId),
+    env.DB.prepare(`UPDATE messages SET knowledge_registered = 1 WHERE message_id = ?
+      AND EXISTS (SELECT 1 FROM knowledge_jobs j WHERE j.message_id = messages.message_id)`).bind(messageId),
+  ]);
   const job = await env.DB.prepare("SELECT status, next_attempt_at FROM knowledge_jobs WHERE message_id = ?")
     .bind(messageId).first<{ status: string; next_attempt_at: number }>();
   if (job && ["pending", "retry", "waiting_attachment"].includes(job.status) && job.next_attempt_at <= Date.now()) await enqueueKnowledge(messageId, env);
@@ -48,8 +52,8 @@ export function cancellationStatements(messageId: string, env: Env): D1PreparedS
 }
 
 async function load(messageId: string, env: Env): Promise<Job | null> {
-  return env.DB.prepare(`SELECT j.*, m.text, m.sender_role, m.sender_name, m.message_type, m.conversation_id, m.source_type, m.sent_at, m.unsent_at
-    FROM knowledge_jobs j JOIN messages m USING(message_id) WHERE message_id = ?`).bind(messageId).first<Job>();
+  return env.DB.prepare(`SELECT j.*, m.text, m.sender_role, m.sender_name, m.message_type, m.conversation_id, m.source_type, m.sent_at, m.unsent_at, m.knowledge_document_id, d.title AS document_title
+    FROM knowledge_jobs j JOIN messages m USING(message_id) LEFT JOIN knowledge_documents d ON d.id = m.knowledge_document_id WHERE message_id = ?`).bind(messageId).first<Job>();
 }
 
 async function removeIndex(messageId: string, env: Env): Promise<void> {
@@ -89,7 +93,7 @@ async function processKnowledge(messageId: string, env: Env): Promise<void> {
       if (attachment.status !== "stored") throw new ProcessingError("attachment_unavailable", true);
       if (job.extraction_attempts >= 2) throw new ProcessingError("extraction_retry_limit", true);
       await env.DB.prepare("UPDATE knowledge_jobs SET extraction_attempts = extraction_attempts + 1 WHERE message_id = ?").bind(messageId).run();
-      const extracted = await extractAttachment(attachment, env);
+      const extracted = await extractAttachment({ ...attachment, require_full_text: job.source_type === "document" }, env);
       const current = await load(messageId, env);
       if (current?.unsent_at !== null) { await removeIndex(messageId, env); return; }
       await env.DB.batch([
@@ -100,7 +104,11 @@ async function processKnowledge(messageId: string, env: Env): Promise<void> {
         env.DB.prepare(`UPDATE knowledge_jobs SET extracted_text = ?, cache_key = ?, processor = ?
           WHERE message_id = ? AND status != 'delete_pending'`).bind(extracted.text, extracted.cacheKey, extracted.processor, messageId),
       ]);
-      text = extracted.text;
+      if (job.source_type === "document" && job.knowledge_document_id) {
+        await env.DB.prepare("UPDATE knowledge_documents SET content_text = ? WHERE id = ? AND canonical_message_id = ? AND content_text IS NULL AND deleted_at IS NULL")
+          .bind(extracted.text, job.knowledge_document_id, messageId).run();
+      }
+      text = job.document_title ? `【アップロード資料: ${job.document_title}】\n${extracted.text}` : extracted.text;
     }
     await env.DB.prepare("UPDATE knowledge_jobs SET extracted_text = ? WHERE message_id = ? AND status != 'delete_pending'").bind(text, messageId).run();
   }
@@ -178,14 +186,20 @@ export async function consumeKnowledge(batch: MessageBatch<KnowledgeJob>, env: E
 export async function repairKnowledgeJobs(env: Env): Promise<void> {
   // Catch both missed producer sends and attachments completed during deployment.
   await env.DB.prepare(`INSERT INTO knowledge_jobs(message_id)
-    SELECT m.message_id FROM messages m LEFT JOIN attachments a USING(message_id)
-    WHERE m.unsent_at IS NULL AND m.source_type != 'user' AND (m.message_type = 'text' OR a.status = 'stored')
+    SELECT m.message_id FROM messages m INDEXED BY messages_unregistered_knowledge LEFT JOIN attachments a USING(message_id)
+    WHERE m.knowledge_registered = 0 AND m.unsent_at IS NULL AND m.source_type != 'user'
+    AND m.message_type IN ('text', 'image', 'audio', 'video', 'file') AND (m.message_type = 'text' OR a.status = 'stored')
     AND NOT EXISTS (SELECT 1 FROM knowledge_jobs j WHERE j.message_id = m.message_id) LIMIT 100`).run();
-  const { results } = await env.DB.prepare(`SELECT message_id FROM knowledge_jobs
+  await env.DB.prepare(`UPDATE messages SET knowledge_registered = 1 WHERE message_id IN (
+    SELECT m.message_id FROM messages m INDEXED BY messages_unregistered_knowledge
+    WHERE m.knowledge_registered = 0 AND m.unsent_at IS NULL AND m.source_type != 'user'
+      AND m.message_type IN ('text', 'image', 'audio', 'video', 'file')
+      AND EXISTS (SELECT 1 FROM knowledge_jobs j WHERE j.message_id = m.message_id) LIMIT 100)`).run();
+  const { results } = await env.DB.prepare(`SELECT message_id FROM knowledge_jobs INDEXED BY knowledge_jobs_dispatch_due
     WHERE status IN ('pending', 'retry', 'budget_wait', 'waiting_attachment', 'delete_pending')
-    AND next_attempt_at <= ? AND (queued_at IS NULL OR queued_at < ?) AND lease_until <= ?
-    ORDER BY CASE WHEN status = 'delete_pending' THEN 0 ELSE 1 END, next_attempt_at LIMIT 100`)
-    .bind(Date.now(), Date.now() - 10 * 60_000, Date.now()).all<{ message_id: string }>();
+    AND max(next_attempt_at, COALESCE(queued_at + 600000, 0), lease_until) <= ?
+    ORDER BY max(next_attempt_at, COALESCE(queued_at + 600000, 0), lease_until), CASE WHEN status = 'delete_pending' THEN 0 ELSE 1 END LIMIT 100`)
+    .bind(Date.now()).all<{ message_id: string }>();
   for (let offset = 0; offset < results.length; offset += 100) {
     const part = results.slice(offset, offset + 100);
     try {

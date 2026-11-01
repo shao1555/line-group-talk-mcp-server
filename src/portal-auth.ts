@@ -27,7 +27,7 @@ function redirect(location: string, cookies: string[] = [], inherited?: Headers)
   return new Response(null, { status: 303, headers });
 }
 
-export async function beginLineLogin(env: Env, oauthRequest?: AuthRequest, headers?: Headers): Promise<Response> {
+export async function beginLineLogin(env: Env, oauthRequest?: AuthRequest, headers?: Headers, returnTo = "/"): Promise<Response> {
   if (!loginConfigured(env)) return new Response("LINE ログインの設定を準備しています。", { status: 503 });
   const upstream = oauthRequest ? await oauthServer(env).getOAuthApi(env).beginUpstream(oauthRequest, { headers }) : undefined;
   const state = upstream?.state ?? randomToken(), nonce = randomToken(), verifier = randomToken();
@@ -36,8 +36,8 @@ export async function beginLineLogin(env: Env, oauthRequest?: AuthRequest, heade
   await env.DB.batch([
     env.DB.prepare("DELETE FROM portal_login_flows WHERE expires_at <= ?").bind(Date.now()),
     env.DB.prepare("DELETE FROM portal_sessions WHERE expires_at <= ?").bind(Date.now()),
-    env.DB.prepare("INSERT INTO portal_login_flows(state_hash, nonce, code_verifier, expires_at, oauth_flow) VALUES (?, ?, ?, ?, ?)")
-      .bind(await sha256(state), nonce, verifier, Date.now() + 600_000, oauthRequest ? 1 : 0),
+    env.DB.prepare("INSERT INTO portal_login_flows(state_hash, nonce, code_verifier, expires_at, oauth_flow, return_to) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(await sha256(state), nonce, verifier, Date.now() + 600_000, oauthRequest ? 1 : 0, safeReturnTo(returnTo)),
   ]);
   const authorize = new URL("https://access.line.me/oauth2/v2.1/authorize");
   authorize.search = new URLSearchParams({ response_type: "code", client_id: env.LINE_LOGIN_CHANNEL_ID,
@@ -82,14 +82,14 @@ export async function handlePortalAuth(request: Request, env: Env): Promise<Resp
   if (!loginConfigured(env)) return new Response("LINE ログインの設定を準備しています。", { status: 503 });
   const callback = `${portalOrigin(env)}/auth/line/callback`;
   if (url.pathname === "/auth/line") {
-    return beginLineLogin(env);
+    return beginLineLogin(env, undefined, undefined, url.searchParams.get("returnTo") ?? "/");
   }
   if (url.pathname !== "/auth/line/callback") return new Response("Not found", { status: 404 });
   const state = url.searchParams.get("state") ?? "", bound = cookie(request, FLOW_COOKIE);
   if (!/^[\w-]{43}$/.test(state) || !/^[\w-]{43}$/.test(bound)) return new Response("ログインを最初からやり直してください。", { status: 400 });
   const flow = await env.DB.prepare(`DELETE FROM portal_login_flows WHERE state_hash = ? AND state_hash = ? AND expires_at > ?
-    RETURNING nonce, code_verifier, oauth_flow`).bind(await sha256(state), await sha256(bound), Date.now())
-    .first<{ nonce: string; code_verifier: string; oauth_flow: number }>();
+    RETURNING nonce, code_verifier, oauth_flow, return_to`).bind(await sha256(state), await sha256(bound), Date.now())
+    .first<{ nonce: string; code_verifier: string; oauth_flow: number; return_to: string }>();
   const code = url.searchParams.get("code");
   if (!flow) {
     return redirect(`${portalOrigin(env)}/?login=failed`, [setCookie(FLOW_COOKIE, "", 0)]);
@@ -132,11 +132,15 @@ export async function handlePortalAuth(request: Request, env: Env): Promise<Resp
         .bind(await sha256(session), claims.sub, randomToken(), Date.now() + SESSION_SECONDS * 1000),
     ]);
     // LINE access/refresh/ID tokens are never persisted or exposed to the browser.
-    const target = downstream ? await completeMcpAuthorization(downstream, claims.sub, env) : `${portalOrigin(env)}/`;
+    const target = downstream ? await completeMcpAuthorization(downstream, claims.sub, env) : `${portalOrigin(env)}${safeReturnTo(flow.return_to)}`;
     return redirect(target, [setCookie(SESSION_COOKIE, session, SESSION_SECONDS), setCookie(FLOW_COOKIE, "", 0)], upstreamHeaders);
   } catch {
     console.error(JSON.stringify({ event: "portal_login_failed" }));
     return redirect(downstream ? authorizationErrorRedirect(downstream, "access_denied") : `${portalOrigin(env)}/?login=failed`,
       [setCookie(FLOW_COOKIE, "", 0)], upstreamHeaders);
   }
+}
+
+export function safeReturnTo(value: string): string {
+  return /^\/\?view=(?:knowledge|history|connections)$/.test(value) || /^\/knowledge\/[a-f0-9-]{36}(?:\?conversationId=[CR][a-f0-9]{32})?$/.test(value) ? value : "/";
 }

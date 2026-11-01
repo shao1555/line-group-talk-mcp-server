@@ -1,6 +1,7 @@
 {
 	"name": "line-group-talk-mcp-server",
 	"main": "src/index.ts",
+	"rules": [{ "type": "Data", "globs": ["**/*.png"], "fallthrough": true }],
 	"workers_dev": true,
 	"routes": [{ "pattern": "line-talk.example.com", "custom_domain": true }],
 	"account_id": "00000000000000000000000000000000",

@@ -4,7 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { PDFDocument } from "pdf-lib";
 import { repairKnowledgeJobs } from "../src/knowledge";
 import worker from "../src/index";
-import { reserveAI, EMBEDDING_MODEL, VISION_MODEL, AUDIO_MODEL } from "../src/ai";
+import { reserveAI, EMBEDDING_MODEL, VISION_MODEL, AUDIO_MODEL, settleAIUsage } from "../src/ai";
 import { bindings, message, post, unsend } from "./helpers";
 
 const vector = Array.from({ length: 1024 }, (_, i) => i === 0 ? 1 : 0);
@@ -120,7 +120,7 @@ describe("knowledge extraction and indexing", () => {
     expect(await job()).toMatchObject({ status: "budget_wait", extraction_attempts: 0 });
     expect(bindings.AI.run).not.toHaveBeenCalled();
     expect(await env.DB.prepare("SELECT count(*) AS n FROM attachments WHERE status = 'stored'").first("n")).toBe(1);
-    await env.DB.prepare("DELETE FROM ai_usage").run();
+    await env.DB.batch([env.DB.prepare("DELETE FROM ai_usage"), env.DB.prepare("DELETE FROM ai_usage_totals")]);
     await env.DB.prepare("UPDATE knowledge_jobs SET next_attempt_at = 0").run();
     await consume();
     expect(await job()).toMatchObject({ status: "ready" });
@@ -215,6 +215,14 @@ describe("knowledge extraction and indexing", () => {
     expect((await job())?.queued_at).toBeNull();
     await repairKnowledgeJobs(bindings);
     expect((await job())?.queued_at).toEqual(expect.any(Number));
+  });
+
+  it("keeps constant-size accounting totals consistent with the audit ledger and repeated settlement", async () => {
+    const id = await reserveAI('answer', VISION_MODEL, 1, 50_000, bindings);
+    await settleAIUsage(id, 123, bindings); await settleAIUsage(id, 123, bindings);
+    const rows = await env.DB.prepare("SELECT charged_microusd, units FROM ai_usage_totals").all();
+    expect(rows.results).toEqual([expect.objectContaining({ charged_microusd: 123, units: 1 }), expect.objectContaining({ charged_microusd: 123, units: 1 })]);
+    expect(await env.DB.prepare("SELECT charged_microusd FROM ai_usage WHERE id = ?").bind(id).first('charged_microusd')).toBe(123);
   });
 
 });

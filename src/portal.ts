@@ -1,8 +1,9 @@
-import { handleHistoryImport } from "./history-import";
+import { handleDocuments, listDocuments } from "./documents";
+import { handleHistoryImport, historyImportStatus } from "./history-import";
 import { sha256 } from "./ai";
 import { readLimitedBody } from "./http";
 import { accessibleConversations, verifyConversationAccess } from "./conversations";
-import { handlePortalAuth, portalSession, validPortalMutation, randomToken, portalOrigin, loginConfigured } from "./portal-auth";
+import { handlePortalAuth, portalSession, validPortalMutation, randomToken, portalOrigin, loginConfigured, safeReturnTo } from "./portal-auth";
 import { portalHtml, portalJs, portalCss } from "./portal-ui";
 import { handleMcpConsent } from "./oauth-consent";
 import { oauthServer } from "./oauth-server";
@@ -10,9 +11,14 @@ import { oauthServer } from "./oauth-server";
 export async function handlePortal(request: Request, env: Env): Promise<Response> {
   let response: Response;
   try { response = await route(request, env); }
-  catch {
-    console.error(JSON.stringify({ event: "portal_request_failed" }));
-    response = Response.json({ error: "参加情報を確認できませんでした。少し待ってから再試行してください。" }, { status: 503 });
+  catch (error) {
+    const describe = (value: unknown) => value instanceof Error ? `${value.name}: ${value.message}`
+      .replace(/https?:\/\/[^\s]+/g, "[url]").replace(/[A-Za-z0-9_-]{32,}/g, "[id]").slice(0, 300) : "Unknown error";
+    console.error(JSON.stringify({ event: "portal_request_failed", path: new URL(request.url).pathname,
+      error: describe(error), cause: error instanceof Error ? describe(error.cause) : undefined }));
+    const quota = error instanceof Error && /free tier daily row (?:read|write) limit/.test(error.message);
+    response = Response.json({ error: quota ? "サービスの本日の利用上限に達しています。次の日本時間9:00以降にお試しください。" : "参加情報を確認できませんでした。少し待ってから再試行してください。",
+      ...(quota ? { code: "service_daily_limit" } : {}) }, { status: 503 });
   }
   response.headers.set("Cache-Control", "no-store");
   response.headers.set("Referrer-Policy", new URL(request.url).pathname === "/authorize" ? "same-origin" : "no-referrer");
@@ -27,8 +33,8 @@ async function route(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (path === "/authorize") return handleMcpConsent(request, env);
   if (path.startsWith("/auth/")) return handlePortalAuth(request, env);
-  if (request.method === "GET" && (path === "/" || path === "/portal")) {
-    return new Response(portalHtml(loginConfigured(env)), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  if (request.method === "GET" && (path === "/" || path === "/portal" || /^\/knowledge\/[a-f0-9-]{36}$/.test(path))) {
+    return new Response(portalHtml(loginConfigured(env), safeReturnTo(path + new URL(request.url).search)), { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
   if (request.method === "GET" && path === "/portal.js") return new Response(portalJs, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
   if (request.method === "GET" && path === "/portal.css") return new Response(portalCss, { headers: { "Content-Type": "text/css; charset=utf-8" } });
@@ -40,9 +46,12 @@ async function route(request: Request, env: Env): Promise<Response> {
       FROM oauth_connections WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 100`)
       .bind(session.userId, Date.now()).all();
     return Response.json({ user: { displayName: session.displayName }, csrfToken: session.csrfToken,
-      ...accessible, connections: connections.results, mcpEndpoint: `${portalOrigin(env)}/mcp` });
+      ...accessible, documents: await listDocuments(session.userId, accessible.conversations.map((c) => c.id), env), connections: connections.results, mcpEndpoint: `${portalOrigin(env)}/mcp` });
   }
+  if (path === "/api/imports" && request.method === "GET") return historyImportStatus(session.userId, env);
+  if (request.method === "GET" && /^\/api\/documents\/[a-f0-9-]{36}\/(?:file|content)$/.test(path)) return handleDocuments(request, env, session.userId);
   if (!await validPortalMutation(request, session, env)) return Response.json({ error: "ページを再読み込みして試してください。" }, { status: 403 });
+  if (path === "/api/documents" || path.startsWith("/api/documents/")) return handleDocuments(request, env, session.userId);
   if (request.method === "POST" && (path === "/api/imports" || /^\/api\/imports\/[a-f0-9]{64}\/continue$/.test(path))) return handleHistoryImport(request, env, session.userId);
   const connection = path.match(/^\/api\/connections\/([a-f0-9-]{36})$/);
   if (connection && request.method === "DELETE") {
@@ -66,7 +75,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       return Response.json({ error: "名前と参照するトークを選んでください。" }, { status: 400 });
     }
     const ids = [...new Set(input.conversationIds as string[])];
-    const allowed = await Promise.all(ids.map((id) => verifyConversationAccess(session.userId, id, env)));
+    const allowed = await Promise.all(ids.map((id) => verifyConversationAccess(session.userId, id, env, false)));
     if (allowed.some((item) => !item)) return Response.json({ error: "参照できないトークが含まれています。更新して選び直してください。" }, { status: 403 });
     const token = randomToken(), now = Date.now(), expiry = now + 30 * 24 * 3600_000;
     const created = await env.DB.prepare(`INSERT INTO search_clients(token_hash, label, conversation_ids, owner_user_id, expires_at, created_at)

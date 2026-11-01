@@ -3,7 +3,7 @@ import { AUDIO_MODEL, VISION_MODEL, PROCESSOR_VERSION, ProcessingError, base64, 
 
 export type AttachmentContent = {
   object_key: string; file_name: string | null; content_type: string | null;
-  size_bytes: number | null; duration_ms: number | null; message_type: string; conversation_id: string;
+  require_full_text?: boolean; size_bytes: number | null; duration_ms: number | null; message_type: string; conversation_id: string;
 };
 const MAX_EXTRACT_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT = 40_000;
@@ -75,6 +75,7 @@ export async function extractAttachment(row: AttachmentContent, env: Env): Promi
   } else {
     throw new ProcessingError("unsupported_analysis_format", true);
   }
+  if (row.require_full_text && text.length > MAX_TEXT) throw new ProcessingError("document_text_limit", true);
   if (text.length > MAX_TEXT) text = `${text.slice(0, MAX_TEXT)}\n[処理上限のため以降は未収録]`;
   return { text, cacheKey, processor };
 }

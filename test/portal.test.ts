@@ -1,5 +1,11 @@
+import { syncDocumentProjections } from "../src/documents";
+import { searchKnowledge } from "../src/search";
+import { directEvidenceAvailable } from "../src/direct-chat";
+import { recentMessages } from "../src/knowledge-tools";
+import { recordSentBotMessage } from "../src/bot-messages";
+import { EMBEDDING_MODEL } from "../src/ai";
 import { env } from "cloudflare:workers";
-import { applyD1Migrations, createExecutionContext } from "cloudflare:test";
+import { applyD1Migrations, createExecutionContext, createMessageBatch } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import worker from "../src/index";
 import { sha256 } from "../src/ai";
@@ -229,6 +235,45 @@ describe("history uploads", () => {
     const second = await (await upload(session, exportText.replace('13:15', '13:16'))).json() as { id: string };
     expect(await (await call(`/api/imports/${second.id}/continue`, mutation(session))).json()).toMatchObject({ inserted: 0, done: true });
   });
+  it("reports import and indexing progress only for current member chats, including other uploaders", async () => {
+    await seen(group); await seen(hiddenGroup);
+    membership.add(`${group}:${user}`); membership.add(`${hiddenGroup}:${user}`);
+    const session = await login();
+    const text = '[LINE] グループのトーク履歴\n2020/01/02(木)\n' + Array.from({ length: 8 }, (_, i) => `10:00\t名前\t発言${i}`).join('\n');
+    const { id } = await (await upload(session, text)).json() as { id: string };
+    const read = async (cookie = session.cookie) => (await call('/api/imports', { headers: { Cookie: cookie } })).json() as Promise<{ imports: { id: string }[] }>;
+    expect((await read()).imports).toEqual([expect.objectContaining({ total: 8, cursor: 0, imported: 0, pending: 0, ready: 0 })]);
+    await call(`/api/imports/${id}/continue`, mutation(session));
+    const rows = await env.DB.prepare('SELECT message_id FROM messages WHERE import_id = ? ORDER BY source_line').bind(id).all<{ message_id: string }>();
+    await env.DB.batch(['ready', 'ready', 'failed', 'skipped', 'budget_wait', 'pending', 'pending', 'ready'].map((status, i) =>
+      env.DB.prepare('UPDATE knowledge_jobs SET status = ? WHERE message_id = ?').bind(status, rows.results[i].message_id)));
+    await env.DB.prepare('DELETE FROM knowledge_jobs WHERE message_id = ?').bind(rows.results[6].message_id).run();
+    await env.DB.prepare('UPDATE messages SET unsent_at = 1 WHERE message_id = ?').bind(rows.results[7].message_id).run();
+    const duplicate = await (await upload(session, text + '\n')).json() as { id: string };
+    await call(`/api/imports/${duplicate.id}/continue`, mutation(session));
+    const secret = await (await upload(session, text, hiddenGroup)).json() as { id: string };
+    membership.delete(`${hiddenGroup}:${user}`);
+    const data = await read();
+    expect(data.imports.find((r) => r.id === id)).toMatchObject({ cursor: 8, imported: 8, ready: 2, pending: 2, failed: 1, skipped: 1, budget_wait: 1, cancelled: 1, duplicates: 0 });
+    // A repeated delivery/status write changes no counts; the counter rolls back with its job update.
+    await env.DB.prepare("UPDATE knowledge_jobs SET status = 'ready' WHERE message_id = ?").bind(rows.results[0].message_id).run();
+    await expect(env.DB.batch([
+      env.DB.prepare("UPDATE knowledge_jobs SET status = 'ready' WHERE message_id = ?").bind(rows.results[5].message_id),
+      env.DB.prepare("INSERT INTO history_import_counts(import_id, status, count) VALUES (?, 'ready', -1)").bind(id),
+    ])).rejects.toThrow();
+    expect((await read()).imports.find((r) => r.id === id)).toMatchObject({ ready: 2, pending: 2 });
+    // Budget recovery and a missing/deleted job also keep the buckets consistent.
+    await env.DB.prepare("UPDATE knowledge_jobs SET status = 'ready' WHERE message_id = ?").bind(rows.results[4].message_id).run();
+    await env.DB.prepare('DELETE FROM knowledge_jobs WHERE message_id = ?').bind(rows.results[0].message_id).run();
+    expect((await read()).imports.find((r) => r.id === id)).toMatchObject({ ready: 2, budget_wait: 0, pending: 3 });
+    expect(data.imports.find((r) => r.id === duplicate.id)).toMatchObject({ cursor: 8, imported: 0, duplicates: 8, ready: 0, pending: 0 });
+    expect(JSON.stringify(data)).not.toContain(secret.id);
+    loginUser = other; membership.add(`${group}:${other}`); const member = await login();
+    expect((await read(member.cookie)).imports.map((r) => r.id)).toContain(id);
+    membership.delete(`${group}:${other}`);
+    expect((await read(member.cookie)).imports).toEqual([]);
+    expect((await call('/api/imports')).status).toBe(401);
+  });
   it("requires session, CSRF, live membership, and import ownership", async () => {
     await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`);
     const session = await login();
@@ -257,5 +302,206 @@ describe("history uploads", () => {
     expect((await upload(session, 'not a LINE export')).status).toBe(400);
     expect((await upload(session, 'x'.repeat(2 * 1024 * 1024 + 1))).status).toBe(413);
     expect(await env.DB.prepare('SELECT count(*) AS n FROM history_imports').first('n')).toBe(0);
+  });
+});
+
+
+describe("uploaded knowledge", () => {
+  const vector = Array.from({ length: 1024 }, () => 0.1);
+  beforeEach(() => {
+    vi.spyOn(bindings.ATTACHMENT_QUEUE, "send").mockResolvedValue({ metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } });
+    vi.spyOn(bindings.AI, "run").mockImplementation(async (model) => { if (model !== EMBEDDING_MODEL) throw new Error("Unexpected paid model"); return { data: [vector] }; });
+    vi.spyOn(bindings.KNOWLEDGE, "upsert").mockResolvedValue({ ids: [], count: 0 });
+    vi.spyOn(bindings.KNOWLEDGE, "deleteByIds").mockResolvedValue({ ids: [], count: 0 });
+    vi.spyOn(bindings.KNOWLEDGE, "query").mockResolvedValue({ count: 0, matches: [] });
+  });
+  async function upload(session: { cookie: string; csrf: string }, chats = [group], text = "集合場所は南口です。", fileName = "note.txt") {
+    return call('/api/documents?' + new URLSearchParams({ title: '旅行ノート', fileName, conversationIds: JSON.stringify(chats) }), { ...mutation(session), body: text });
+  }
+  async function consume(id: string) {
+    await worker.queue(createMessageBatch('line-group-talk-knowledge', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: { messageId: id } }]), bindings);
+  }
+  async function ready(id: string, chats = [group]) {
+    await consume(`document:${id}`); await syncDocumentProjections(bindings, id);
+    for (const chat of chats) await consume(`knowledge:${id}:${chat}`);
+  }
+  function toggle(session: { cookie: string; csrf: string }, id: string, enabled: boolean, chat = group) {
+    return call(`/api/documents/${id}/chats/${chat}`, { ...mutation(session, { enabled }), method: 'PUT' });
+  }
+  it("uploads one original and reuses extracted text and embeddings across selected chats", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`); membership.add(`${hiddenGroup}:${user}`);
+    const session = await login(); const response = await upload(session, [group, hiddenGroup]);
+    expect(response.status).toBe(201); const { id } = await response.json() as { id: string };
+    expect((await env.ATTACHMENTS.get(`knowledge-documents/${id}`))?.size).toBeGreaterThan(0);
+    await ready(id, [group, hiddenGroup]);
+    expect(bindings.AI.run).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(bindings.KNOWLEDGE.upsert).mock.calls.map(([vectors]) => vectors[0].namespace)).toEqual([`document:${id}`, group, hiddenGroup]);
+    const projection = `knowledge:${id}:${group}`;
+    const chunk = await env.DB.prepare("SELECT id FROM knowledge_chunks WHERE message_id = ?").bind(projection).first<string>('id');
+    vi.mocked(bindings.KNOWLEDGE.query).mockResolvedValue({ count: 1, matches: [{ id: chunk!, score: 0.9 }] });
+    expect(await searchKnowledge('集合場所', group, bindings)).toEqual([expect.objectContaining({ document_id: id, document_title: '旅行ノート', fileName: 'note.txt' })]);
+    expect((await recentMessages(group, 50, bindings)).some((r) => r.message_id === projection)).toBe(false);
+    const file = await call(`/api/documents/${id}/file`, { headers: { Cookie: session.cookie } });
+    expect(new TextDecoder().decode(await file.arrayBuffer())).toBe('集合場所は南口です。'); expect(file.headers.get('Content-Disposition')).toContain('attachment;');
+  });
+  it("allows a member to disable and re-enable someone else's knowledge but not delete or reshare it", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`);
+    const owner = await login(); const { id } = await (await upload(owner)).json() as { id: string }; await ready(id);
+    loginUser = other; membership.add(`${group}:${other}`); membership.add(`${hiddenGroup}:${other}`); const member = await login();
+    const portal = await (await call('/api/portal', { headers: { Cookie: member.cookie } })).json() as { documents: { id: string; is_owner: number }[] };
+    expect(portal.documents).toEqual([expect.objectContaining({ id, is_owner: 0 })]);
+    expect((await call(`/api/documents/${id}`, { ...mutation(member), method: 'DELETE' })).status).toBe(403);
+    expect((await toggle(member, id, true, hiddenGroup)).status).toBe(403);
+    expect((await toggle(member, id, false)).status).toBe(204);
+    expect((await call(`/api/documents/${id}/file`, { headers: { Cookie: member.cookie } })).status).toBe(200);
+    await consume(`knowledge:${id}:${group}`);
+    expect((await toggle(member, id, true)).status).toBe(204); await consume(`knowledge:${id}:${group}`);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}`], other, bindings)).toBe(true);
+    expect(bindings.AI.run).toHaveBeenCalledTimes(1);
+  });
+  it("immediately filters disabled knowledge and invalidates derived bot answers before vector cleanup", async () => {
+    await seen(group); membership.add(`${group}:${user}`); const session = await login();
+    const { id } = await (await upload(session)).json() as { id: string }; await ready(id);
+    const projection = `knowledge:${id}:${group}`;
+    const chunk = await env.DB.prepare("SELECT id FROM knowledge_chunks WHERE message_id = ?").bind(projection).first<string>('id');
+    vi.mocked(bindings.KNOWLEDGE.query).mockResolvedValue({ count: 1, matches: [{ id: chunk!, score: 0.9 }] });
+    const question = `message-${group}`;
+    await env.DB.prepare("INSERT INTO bot_replies(message_id,status,text,evidence_ids,created_at,line_message_id) VALUES (?, 'sent', '南口です', ?, ?, 'document-bot')")
+      .bind(question, JSON.stringify([projection]), Date.now()).run(); await recordSentBotMessage(question, bindings);
+    expect(await directEvidenceAvailable([projection], user, bindings)).toBe(true);
+    expect((await toggle(session, id, false)).status).toBe(204);
+    expect(await searchKnowledge('集合場所', group, bindings)).toEqual([]);
+    expect(await directEvidenceAvailable([projection], user, bindings)).toBe(false);
+    expect(await env.DB.prepare("SELECT text FROM bot_replies WHERE message_id = ?").bind(question).first('text')).toBeNull();
+    expect((await recentMessages(group, 50, bindings)).some((r) => r.message_id === 'document-bot')).toBe(false);
+    expect(bindings.KNOWLEDGE.deleteByIds).not.toHaveBeenCalled();
+  });
+  it("keeps the other chat enabled when one chat disables a shared document", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`); membership.add(`${hiddenGroup}:${user}`);
+    const session = await login(); const { id } = await (await upload(session, [group, hiddenGroup])).json() as { id: string };
+    await ready(id, [group, hiddenGroup]); await toggle(session, id, false);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}`], user, bindings)).toBe(false);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${hiddenGroup}`], user, bindings)).toBe(true);
+    expect(await env.DB.prepare("SELECT status FROM knowledge_jobs WHERE message_id = ?").bind(`document:${id}`).first('status')).toBe('ready');
+  });
+  it("keeps disabled knowledge hidden when disabling races with vector publication", async () => {
+    await seen(group); membership.add(`${group}:${user}`); const session = await login();
+    const { id } = await (await upload(session)).json() as { id: string };
+    await consume(`document:${id}`); await syncDocumentProjections(bindings, id);
+    vi.mocked(bindings.KNOWLEDGE.upsert).mockImplementationOnce(async () => {
+      await toggle(session, id, false); return { ids: [], count: 0 };
+    });
+    await consume(`knowledge:${id}:${group}`);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}`], user, bindings)).toBe(false);
+    expect(await env.DB.prepare("SELECT status FROM knowledge_jobs WHERE message_id = ?").bind(`knowledge:${id}:${group}`).first('status')).toBe('delete_pending');
+    await consume(`knowledge:${id}:${group}`);
+    expect((await toggle(session, id, true)).status).toBe(204); await consume(`knowledge:${id}:${group}`);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}`], user, bindings)).toBe(true);
+  });
+  it("durably records original deletion even if publishing to the attachment queue fails", async () => {
+    const session = await login(); const { id } = await (await upload(session, [])).json() as { id: string };
+    vi.mocked(bindings.ATTACHMENT_QUEUE.send).mockRejectedValueOnce(new Error('Queue unavailable'));
+    expect((await call(`/api/documents/${id}`, { ...mutation(session), method: 'DELETE' })).status).toBe(204);
+    expect(await env.DB.prepare("SELECT status FROM attachments WHERE message_id = ?").bind(`document:${id}`).first('status')).toBe('delete_pending');
+    expect(await env.DB.prepare("SELECT status FROM knowledge_jobs WHERE message_id = ?").bind(`document:${id}`).first('status')).toBe('delete_pending');
+    expect((await call(`/api/documents/${id}/file`, { headers: { Cookie: session.cookie } })).status).toBe(404);
+  });
+  it("lets only the uploader delete the original and all chat uses", async () => {
+    await seen(group); membership.add(`${group}:${user}`); const session = await login();
+    const { id } = await (await upload(session)).json() as { id: string }; await ready(id);
+    expect((await call(`/api/documents/${id}`, { ...mutation(session), method: 'DELETE' })).status).toBe(204);
+    expect((await call(`/api/documents/${id}/file`, { headers: { Cookie: session.cookie } })).status).toBe(404);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}`], user, bindings)).toBe(false);
+    await consume(`document:${id}`); await consume(`knowledge:${id}:${group}`);
+    await worker.queue(createMessageBatch('line-group-talk-attachments', [{ id: 'delete', timestamp: new Date(), attempts: 1, body: { messageId: `document:${id}` } }]), bindings);
+    expect(await env.ATTACHMENTS.get(`knowledge-documents/${id}`)).toBeNull();
+    const portal = await (await call('/api/portal', { headers: { Cookie: session.cookie } })).json() as { documents: unknown[] };
+    expect(portal.documents).toEqual([]);
+  });
+  it("protects metadata, files, and sharing mutations by membership and CSRF", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`); const session = await login();
+    expect((await upload(session, [hiddenGroup])).status).toBe(403);
+    expect((await call('/api/documents', { method: 'POST' })).status).toBe(401);
+    expect((await call('/api/documents', { method: 'POST', headers: { Cookie: session.cookie } })).status).toBe(403);
+    const { id } = await (await upload(session)).json() as { id: string };
+    loginUser = other; const foreign = await login();
+    const portal = await (await call('/api/portal', { headers: { Cookie: foreign.cookie } })).json() as { documents: unknown[] };
+    expect(portal.documents).toEqual([]);
+    expect((await call(`/api/documents/${id}/file`, { headers: { Cookie: foreign.cookie } })).status).toBe(404);
+    expect((await toggle(foreign, id, false)).status).toBe(403);
+  });
+  it("returns a login-protected full-text link and lets current participants edit, including while disabled", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`); membership.add(`${hiddenGroup}:${user}`);
+    const owner = await login(); const { id } = await (await upload(owner, [group, hiddenGroup])).json() as { id: string }; await ready(id, [group, hiddenGroup]);
+    const page = `/knowledge/${id}?conversationId=${group}`;
+    expect((await call(page)).status).toBe(200);
+    expect((await call(`/api/documents/${id}/content`)).status).toBe(401);
+    const chunk = await env.DB.prepare("SELECT id FROM knowledge_chunks WHERE message_id = ?").bind(`knowledge:${id}:${group}`).first<string>('id');
+    vi.mocked(bindings.KNOWLEDGE.query).mockResolvedValue({ count: 1, matches: [{ id: chunk!, score: 0.9 }] });
+    expect((await searchKnowledge('集合場所', group, bindings))[0].sourceUrl).toBe(`${origin}${page}`);
+    loginUser = other; membership.add(`${group}:${other}`); const member = await login();
+    expect((await toggle(member, id, false)).status).toBe(204);
+    const content = await (await call(`/api/documents/${id}/content?conversationId=${group}`, { headers: { Cookie: member.cookie } })).json() as { text: string; revision: number };
+    expect(content).toMatchObject({ text: '集合場所は南口です。', revision: 1 });
+    const save = await call(`/api/documents/${id}/content?conversationId=${group}`, { ...mutation(member, { text: '集合場所は北口に変更しました。', revision: 1 }), method: 'PUT' });
+    expect(save.status, await save.clone().text()).toBe(200);
+    expect(await save.json()).toMatchObject({ revision: 2 });
+    expect(await directEvidenceAvailable([`knowledge:${id}:${hiddenGroup}`], user, bindings)).toBe(false);
+    expect(await searchKnowledge('集合場所', group, bindings)).toEqual([]);
+    await consume(`document:${id}:r2`);
+    expect(await env.DB.prepare("SELECT status, extracted_text, last_error_code FROM knowledge_jobs WHERE message_id = ?").bind(`document:${id}:r2`).first()).toMatchObject({ status: 'ready' });
+    await syncDocumentProjections(bindings, id);
+    expect(await env.DB.prepare("SELECT message_id, enabled FROM knowledge_document_chats WHERE document_id = ? AND conversation_id = ?").bind(id, hiddenGroup).first()).toMatchObject({ message_id: `knowledge:${id}:${hiddenGroup}:r2`, enabled: 1 });
+    expect(await env.DB.prepare("SELECT status, extracted_text FROM knowledge_jobs WHERE message_id = ?").bind(`knowledge:${id}:${hiddenGroup}:r2`).first()).toMatchObject({ status: 'pending', extracted_text: expect.any(String) });
+    await consume(`knowledge:${id}:${hiddenGroup}:r2`);
+    const revised = await env.DB.prepare("SELECT extracted_text FROM knowledge_jobs WHERE message_id = ?").bind(`knowledge:${id}:${hiddenGroup}:r2`).first<string>('extracted_text');
+    expect(revised).toContain('北口'); expect(revised).not.toContain('南口');
+    const aiCalls = vi.mocked(bindings.AI.run).mock.calls.length;
+    expect((await toggle(member, id, true)).status).toBe(204); await consume(`knowledge:${id}:${group}:r2`);
+    expect(await directEvidenceAvailable([`knowledge:${id}:${group}:r2`], other, bindings)).toBe(true);
+    expect(vi.mocked(bindings.AI.run).mock.calls).toHaveLength(aiCalls);
+    const stale = await call(`/api/documents/${id}/content`, { ...mutation(owner, { text: '上書き不可', revision: 1 }), method: 'PUT' });
+    expect(stale.status).toBe(409);
+    expect((await call(`/api/documents/${id}`, { ...mutation(member), method: 'DELETE' })).status).toBe(403);
+  });
+  it("rejects full-text viewing and editing through an unrelated chat", async () => {
+    await seen(group); await seen(hiddenGroup); membership.add(`${group}:${user}`); const owner = await login();
+    const { id } = await (await upload(owner)).json() as { id: string }; await ready(id);
+    loginUser = other; membership.add(`${hiddenGroup}:${other}`); const foreign = await login();
+    expect((await call(`/api/documents/${id}/content?conversationId=${hiddenGroup}`, { headers: { Cookie: foreign.cookie } })).status).toBe(404);
+    expect((await call(`/api/documents/${id}/content`, { ...mutation(foreign, { text: '改ざん', revision: 1 }), method: 'PUT' })).status).toBe(404);
+    membership.add(`${group}:${other}`);
+    expect((await call(`/api/documents/${id}/content?conversationId=${hiddenGroup}`, { headers: { Cookie: foreign.cookie } })).status).toBe(404);
+    expect((await call(`/api/documents/${id}/content?conversationId=${group}`, { headers: { Cookie: foreign.cookie } })).status).toBe(200);
+  });
+  it("prevents concurrent editors from overwriting each other's version", async () => {
+    const owner = await login(); const { id } = await (await upload(owner, [])).json() as { id: string };
+    const save = (text: string) => call(`/api/documents/${id}/content`, { ...mutation(owner, { text, revision: 1 }), method: 'PUT' });
+    const responses = await Promise.all([save('一人目の編集'), save('二人目の編集')]);
+    expect(responses.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(await env.DB.prepare("SELECT revision FROM knowledge_documents WHERE id = ?").bind(id).first('revision')).toBe(2);
+  });
+  it("preserves safe full-text and upload destinations across LINE login", async () => {
+    for (const target of [`/knowledge/00000000-0000-4000-8000-000000000000?conversationId=${group}`, '/?view=knowledge', '/?view=history', '/?view=connections', 'https://evil.example/']) {
+      const begin = await call('/auth/line?returnTo=' + encodeURIComponent(target));
+      const location = new URL(begin.headers.get('Location')!); const state = location.searchParams.get('state');
+      const response = await call('/auth/line/callback?code=code&state=' + state, { headers: { Cookie: `__Host-line_oauth=${state}` } });
+      expect(response.headers.get('Location')).toBe(origin + (target.startsWith('https:') ? '/' : target));
+    }
+  });
+  it("does not present truncated text as the full knowledge document", async () => {
+    const owner = await login(); const { id } = await (await upload(owner, [], 'あ'.repeat(40_001))).json() as { id: string };
+    await consume(`document:${id}`);
+    expect(await env.DB.prepare("SELECT status, last_error_code FROM knowledge_jobs WHERE message_id = ?").bind(`document:${id}`).first()).toMatchObject({ status: 'failed', last_error_code: 'document_text_limit' });
+    expect(await env.DB.prepare("SELECT content_text FROM knowledge_documents WHERE id = ?").bind(id).first('content_text')).toBeNull();
+    expect(bindings.AI.run).not.toHaveBeenCalled();
+  });
+  it("supports private knowledge with no selected chats and rejects unsupported or empty files", async () => {
+    const session = await login();
+    const response = await upload(session, []); expect(response.status).toBe(201);
+    const { id } = await response.json() as { id: string }; await ready(id, []);
+    expect(await env.DB.prepare("SELECT count(*) AS n FROM knowledge_document_chats").first('n')).toBe(0);
+    expect((await upload(session, [], 'binary', 'app.exe')).status).toBe(400);
+    expect((await upload(session, [], '')).status).toBe(400);
   });
 });

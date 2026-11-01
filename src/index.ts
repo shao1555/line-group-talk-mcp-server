@@ -1,3 +1,5 @@
+import { ensureRichMenu } from "./rich-menu";
+import { syncDocumentProjections } from "./documents";
 import { recordSentBotMessage, repairSentBotMessages } from "./bot-messages";
 import { cancelAttachment, consumeAttachments, recordAttachment, repairAttachmentJobs } from "./attachments";
 import type { MediaMessage, AttachmentJob } from "./attachments";
@@ -115,14 +117,16 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await repairSentBotMessages(env);
     await repairAttachmentJobs(env);
+    await syncDocumentProjections(env);
     await repairKnowledgeJobs(env);
+    await ensureRichMenu(env);
   },
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     env = envForRequest(request, env);
     const path = new URL(request.url).pathname;
     if (path.startsWith("/.well-known/oauth-protected-resource") && ctx) return mcpResource(env).fetch(request, env, ctx);
     if ((path.startsWith("/.well-known/") || path.startsWith("/oauth/")) && ctx) return oauthServer(env).fetch(request, env, ctx);
-    if (["/", "/portal", "/portal.js", "/portal.css", "/authorize"].includes(path) || path.startsWith("/auth/") || path.startsWith("/api/")) {
+    if (["/", "/portal", "/portal.js", "/portal.css", "/authorize"].includes(path) || path.startsWith("/knowledge/") || path.startsWith("/auth/") || path.startsWith("/api/")) {
       return handlePortal(request, env);
     }
     if (path === "/health" && request.method === "GET") return Response.json({ ok: true });

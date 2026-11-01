@@ -1,5 +1,5 @@
-import { readFileSync, readdirSync } from "node:fs";
-import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { fileURLToPath } from "node:url";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -8,11 +8,7 @@ export default defineConfig({
     wrangler: { configPath: "./wrangler.jsonc" },
     miniflare: {
       bindings: {
-        TEST_MIGRATIONS: readdirSync(new URL("./migrations/", import.meta.url)).filter((name) => name.endsWith(".sql")).sort().map((name) => ({
-          name,
-          queries: readFileSync(new URL(`./migrations/${name}`, import.meta.url), "utf8")
-            .split(";").filter((query) => query.trim()),
-        })),
+        TEST_MIGRATIONS: await readD1Migrations(fileURLToPath(new URL("./migrations/", import.meta.url))),
       },
     },
   })],

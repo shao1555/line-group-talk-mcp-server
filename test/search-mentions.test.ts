@@ -6,12 +6,31 @@ import worker from "../src/index";
 import { sha256, EMBEDDING_MODEL, VISION_MODEL, reserveAI } from "../src/ai";
 import { searchKnowledge } from "../src/search";
 import { mentionQuestion } from "../src/mentions";
-import { collectAnswerEvidence, formatAnswerEvidence } from "../src/answer-context";
+import { collectAnswerEvidence, formatAnswerEvidence, evidenceDates } from "../src/answer-context";
 import { parseHistoryPlan } from "../src/history-plan";
 import { bindings, message, post, unsend } from "./helpers";
 
 const token = "test-search-token-abcdefghijklmnopqrstuvwxyz123456";
 const vector = Array.from({ length: 1024 }, () => 0.1);
+describe('explicit calendar dates in evidence', () => {
+  const now = Date.parse('2026-11-01T00:30:00+09:00');
+  it('normalizes full-width era dates and compares calendar days in Japan', () => {
+    expect(evidenceDates('令和７年１０月２６日（日）開催予定。2026/11/01と2026-11-02も参照。', 0, now).mentioned_dates).toEqual([
+      { date: '2025-10-26', relative_to_current_time: 'past' },
+      { date: '2026-11-01', relative_to_current_time: 'today' },
+      { date: '2026-11-02', relative_to_current_time: 'future' },
+    ]);
+  });
+  it('rejects invalid dates and does not guess a missing year or confuse the posting date', () => {
+    expect(evidenceDates('2025年2月29日、2025/13/01、10月26日、令和元年5月1日、2024年2月29日', now, now)).toEqual({
+      sent_at_jst: '2026-11-01 00:30:00 JST', mentioned_dates: [
+        { date: '2019-05-01', relative_to_current_time: 'past' },
+        { date: '2024-02-29', relative_to_current_time: 'past' },
+      ],
+    });
+  });
+});
+
 beforeAll(async () => { await applyD1Migrations(env.DB, env.TEST_MIGRATIONS); });
 beforeEach(async () => {
   await env.DB.batch(["attachments", "messages", "unsent_messages"].map((table) => env.DB.prepare(`DELETE FROM ${table}`)));

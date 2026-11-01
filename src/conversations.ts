@@ -31,17 +31,17 @@ export async function recordConversation(event: ConversationEvent, env: Env): Pr
 export class MembershipUnavailable extends Error {}
 export type AccessibleConversation = { id: string; name: string; type: string; messageCount: number; firstMessageAt: string | null; lastMessageAt: string | null };
 
-export async function verifyConversationAccess(userId: string, conversationId: string, env: Env): Promise<AccessibleConversation | null> {
+export async function verifyConversationAccess(userId: string, conversationId: string, env: Env, includeStats = true, signal?: AbortSignal): Promise<AccessibleConversation | null> {
   const candidate = await env.DB.prepare(`SELECT c.source_type, c.last_event_at, cm.status,
-    (SELECT count(*) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL) AS message_count,
-    (SELECT min(sent_at) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL) AS first_at,
-    (SELECT max(sent_at) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL) AS last_at
+    ${includeStats ? `(SELECT count(*) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL AND m.knowledge_document_id IS NULL)` : '0'} AS message_count,
+    ${includeStats ? `(SELECT min(sent_at) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL AND m.knowledge_document_id IS NULL)` : 'NULL'} AS first_at,
+    ${includeStats ? `(SELECT max(sent_at) FROM messages m WHERE m.conversation_id = c.conversation_id AND m.unsent_at IS NULL AND m.knowledge_document_id IS NULL)` : 'NULL'} AS last_at
     FROM conversations c LEFT JOIN conversation_members cm ON cm.conversation_id = c.conversation_id AND cm.user_id = ?
     WHERE c.conversation_id = ? AND c.bot_active = 1`)
     .bind(userId, conversationId).first<{ source_type: string; last_event_at: number; status: string | null; message_count: number; first_at: number | null; last_at: number | null }>();
   if (!candidate || candidate.status === "left" || !["group", "room"].includes(candidate.source_type)) return null;
   const root = `https://api.line.me/v2/bot/${candidate.source_type}/${encodeURIComponent(conversationId)}`;
-  const options = { headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }, signal: AbortSignal.timeout(5000) };
+  const options = { headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }, signal: signal ?? AbortSignal.timeout(5000) };
   try {
     const member = await fetch(`${root}/member/${encodeURIComponent(userId)}`, options);
     if (member.status === 404) { await member.body?.cancel(); return null; }
@@ -50,7 +50,7 @@ export async function verifyConversationAccess(userId: string, conversationId: s
     if (profile.userId !== userId) throw new MembershipUnavailable();
     let name = "複数人トーク";
     if (candidate.source_type === "group") {
-      const summary = await fetch(`${root}/summary`, { ...options, signal: AbortSignal.timeout(5000) });
+      const summary = await fetch(`${root}/summary`, { ...options, signal: signal ?? AbortSignal.timeout(5000) });
       if (summary.status === 404) { await summary.body?.cancel(); return null; }
       if (!summary.ok) { await summary.body?.cancel(); throw new MembershipUnavailable(); }
       const data = await summary.json() as { groupId?: unknown; groupName?: unknown };
@@ -72,14 +72,14 @@ export async function verifyConversationAccess(userId: string, conversationId: s
   }
 }
 
-export async function accessibleConversations(userId: string, env: Env): Promise<{ conversations: AccessibleConversation[]; incomplete: boolean }> {
+export async function accessibleConversations(userId: string, env: Env, includeStats = true): Promise<{ conversations: AccessibleConversation[]; incomplete: boolean }> {
   const rows = await env.DB.prepare("SELECT conversation_id FROM conversations WHERE bot_active = 1 ORDER BY last_event_at DESC LIMIT 101")
     .all<{ conversation_id: string }>();
   const conversations: AccessibleConversation[] = [];
   let incomplete = rows.results.length > 100;
   for (let offset = 0; offset < Math.min(rows.results.length, 100); offset += 5) {
     const batch = await Promise.allSettled(rows.results.slice(offset, Math.min(offset + 5, 100))
-      .map((row) => verifyConversationAccess(userId, row.conversation_id, env)));
+      .map((row) => verifyConversationAccess(userId, row.conversation_id, env, includeStats)));
     for (const result of batch) {
       if (result.status === "rejected") incomplete = true;
       else if (result.value) conversations.push(result.value);
