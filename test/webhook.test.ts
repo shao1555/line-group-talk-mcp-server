@@ -1,32 +1,12 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/index";
+import { bindings, message, post } from "./helpers";
 
 declare global {
   namespace Cloudflare {
     interface Env { TEST_MIGRATIONS: import("cloudflare:test").D1Migration[] }
   }
-}
-
-const secrets = { LINE_CHANNEL_SECRET: "test-secret", LINE_CHANNEL_ACCESS_TOKEN: "test-token" };
-const bindings = { ...env, ...secrets };
-const message = (text = "hello") => ({
-  type: "message", webhookEventId: "event-1", timestamp: 1700000000000,
-  source: { type: "group", groupId: "group-1", userId: "user-1" },
-  replyToken: "reply-1", mode: "active",
-  message: { id: "message-1", type: "text", text },
-});
-
-async function post(events: unknown[], signature?: string) {
-  const body = JSON.stringify({ destination: "bot-1", events });
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secrets.LINE_CHANNEL_SECRET),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const hmac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
-  const signed = btoa(String.fromCharCode(...hmac));
-  return worker.fetch(new Request("https://example.com/webhook", {
-    method: "POST", headers: { "x-line-signature": signature ?? signed }, body,
-  }), bindings);
 }
 
 async function row() {
@@ -37,7 +17,7 @@ beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 });
 beforeEach(async () => {
-  await env.DB.batch([env.DB.prepare("DELETE FROM messages"), env.DB.prepare("DELETE FROM unsent_messages")]);
+  await env.DB.batch([env.DB.prepare("DELETE FROM attachments"), env.DB.prepare("DELETE FROM messages"), env.DB.prepare("DELETE FROM unsent_messages")]);
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -92,6 +72,7 @@ describe("LINE webhook with D1", () => {
   });
 
   it("handles non-text messages and missing user IDs", async () => {
+    vi.spyOn(bindings.ATTACHMENT_QUEUE, "send").mockRejectedValue(new Error("test queue offline"));
     expect((await post([{ ...message(), source: { type: "group", groupId: "group-1" },
       message: { id: "message-1", type: "image" } }])).status).toBe(200);
     expect(await row()).toMatchObject({ text: null, user_id: null, message_type: "image" });

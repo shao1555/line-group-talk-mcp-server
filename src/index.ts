@@ -1,3 +1,6 @@
+import { cancelAttachment, consumeAttachments, recordAttachment, repairAttachmentJobs } from "./attachments";
+import type { MediaMessage, AttachmentJob } from "./attachments";
+
 type Source = { type: "group" | "room" | "user"; groupId?: string; roomId?: string; userId?: string };
 type LineEvent = {
   type: string;
@@ -6,7 +9,7 @@ type LineEvent = {
   source: Source;
   replyToken?: string;
   mode?: string;
-  message?: { id: string; type: string; text?: string };
+  message?: MediaMessage & { text?: string };
   unsend?: { messageId: string };
 };
 
@@ -45,12 +48,7 @@ async function validSignature(body: Uint8Array, signature: string, secret: strin
 
 async function processEvent(event: LineEvent, env: Env): Promise<void> {
   if (event.type === "unsend" && event.unsend) {
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO unsent_messages(message_id, unsent_at) VALUES (?, ?) ON CONFLICT(message_id) DO NOTHING")
-        .bind(event.unsend.messageId, event.timestamp),
-      env.DB.prepare("UPDATE messages SET text = NULL, unsent_at = ? WHERE message_id = ?")
-        .bind(event.timestamp, event.unsend.messageId),
-    ]);
+    await cancelAttachment(event.unsend.messageId, event.timestamp, env);
     return;
   }
   if (event.type !== "message" || !event.message) return;
@@ -67,6 +65,8 @@ async function processEvent(event: LineEvent, env: Env): Promise<void> {
   `).bind(message.id, event.webhookEventId, source.type, conversationId, source.userId ?? null,
     message.type, message.type === "text" ? message.text ?? null : null,
     event.timestamp, Date.now(), message.id).run();
+
+  await recordAttachment(message, source.type, conversationId, env);
 
   const stored = await env.DB.prepare("SELECT text, unsent_at, replied_at FROM messages WHERE message_id = ?")
     .bind(message.id).first<{ text: string | null; unsent_at: number | null; replied_at: number | null }>();
@@ -86,6 +86,12 @@ async function processEvent(event: LineEvent, env: Env): Promise<void> {
 }
 
 export default {
+  async queue(batch: MessageBatch<AttachmentJob>, env: Env): Promise<void> {
+    await consumeAttachments(batch, env);
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await repairAttachmentJobs(env);
+  },
   async fetch(request, env): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/health" && request.method === "GET") return Response.json({ ok: true });
@@ -117,4 +123,4 @@ export default {
       return new Response("Webhook processing failed", { status: 500 });
     }
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<Env, AttachmentJob>;

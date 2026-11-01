@@ -4,6 +4,20 @@
 	"account_id": "00000000000000000000000000000000",
 	// Latest date supported by the workerd bundled with the pinned toolchain.
 	"compatibility_date": "2026-10-30",
+	"vars": { "MAX_ATTACHMENT_BYTES": "104857600" },
+	"r2_buckets": [{ "binding": "ATTACHMENTS", "bucket_name": "line-group-talk-attachments" }],
+	"queues": {
+		"producers": [{ "binding": "ATTACHMENT_QUEUE", "queue": "line-group-talk-attachments" }],
+		"consumers": [{
+			"queue": "line-group-talk-attachments",
+			"max_batch_size": 1,
+			"max_batch_timeout": 1,
+			"max_concurrency": 1,
+			"max_retries": 5,
+			"dead_letter_queue": "line-group-talk-attachments-dlq"
+		}]
+	},
+	"triggers": { "crons": ["*/5 * * * *"] },
 	"observability": {
 		"enabled": true,
 		"traces": {
